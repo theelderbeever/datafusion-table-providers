@@ -21,6 +21,7 @@ use arrow::datatypes::{
     Time64NanosecondType, TimeUnit, TimestampMillisecondType,
 };
 use bigdecimal::BigDecimal;
+use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
 use num_bigint::BigInt;
 use scylla::frame::response::result::{CollectionType, ColumnSpec, ColumnType, NativeType};
 use scylla::value::{
@@ -79,10 +80,76 @@ pub fn column_specs_to_schema<'a>(
                 spec.name(),
                 map_column_type(spec.name(), spec.typ())?,
                 true,
-            ))
+            )
+            .with_metadata(std::collections::HashMap::from([(
+                SOURCE_TYPE_METADATA_KEY.to_string(),
+                cql_type_name(spec.typ()),
+            )])))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// The CQL name of a column type, e.g. `int`, `frozen<list<text>>`, `map<text, int>`.
+#[must_use]
+pub fn cql_type_name(typ: &ColumnType<'_>) -> String {
+    match typ {
+        ColumnType::Native(native) => match native {
+            NativeType::Ascii => "ascii",
+            NativeType::Boolean => "boolean",
+            NativeType::Blob => "blob",
+            NativeType::Counter => "counter",
+            NativeType::Date => "date",
+            NativeType::Decimal => "decimal",
+            NativeType::Double => "double",
+            NativeType::Duration => "duration",
+            NativeType::Float => "float",
+            NativeType::Int => "int",
+            NativeType::BigInt => "bigint",
+            NativeType::Text => "text",
+            NativeType::Timestamp => "timestamp",
+            NativeType::Inet => "inet",
+            NativeType::SmallInt => "smallint",
+            NativeType::TinyInt => "tinyint",
+            NativeType::Time => "time",
+            NativeType::Timeuuid => "timeuuid",
+            NativeType::Uuid => "uuid",
+            NativeType::Varint => "varint",
+            other => return format!("{other:?}").to_lowercase(),
+        }
+        .to_string(),
+        ColumnType::Collection { frozen, typ } => {
+            let inner = match typ {
+                CollectionType::List(t) => format!("list<{}>", cql_type_name(t)),
+                CollectionType::Set(t) => format!("set<{}>", cql_type_name(t)),
+                CollectionType::Map(k, v) => {
+                    format!("map<{}, {}>", cql_type_name(k), cql_type_name(v))
+                }
+                other => format!("{other:?}").to_lowercase(),
+            };
+            if *frozen {
+                format!("frozen<{inner}>")
+            } else {
+                inner
+            }
+        }
+        ColumnType::Vector { typ, dimensions } => {
+            format!("vector<{}, {dimensions}>", cql_type_name(typ))
+        }
+        ColumnType::UserDefinedType { frozen, definition } => {
+            let name = format!("{}.{}", definition.keyspace, definition.name);
+            if *frozen {
+                format!("frozen<{name}>")
+            } else {
+                name
+            }
+        }
+        ColumnType::Tuple(types) => format!(
+            "tuple<{}>",
+            types.iter().map(cql_type_name).collect::<Vec<_>>().join(", ")
+        ),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Maps a CQL column type to its Arrow equivalent.
@@ -1159,12 +1226,21 @@ mod tests {
         assert_eq!(
             schema.as_ref(),
             &Schema::new(vec![
-                Field::new("id", DataType::Int32, true),
+                Field::new("id", DataType::Int32, true).with_metadata(
+                    std::collections::HashMap::from([(
+                        SOURCE_TYPE_METADATA_KEY.to_string(),
+                        "int".to_string()
+                    )])
+                ),
                 Field::new(
                     "tags",
                     DataType::List(list_item_field(DataType::Utf8)),
                     true
-                ),
+                )
+                .with_metadata(std::collections::HashMap::from([(
+                    SOURCE_TYPE_METADATA_KEY.to_string(),
+                    "list<text>".to_string()
+                )])),
             ])
         );
     }
