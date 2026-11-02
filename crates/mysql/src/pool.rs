@@ -1,3 +1,6 @@
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use crate::conn::MySQLConnection;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
@@ -318,5 +321,19 @@ impl DbConnectionPool<mysql_async::Conn, &'static (dyn ToValue + Sync)> for MySQ
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+}
+
+#[async_trait]
+impl NativeQueryExecutor for MySQLConnectionPool {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> std::result::Result<SendableRecordBatchStream, GenericError> {
+        let conn = self.connect_direct().await?;
+        conn.query_arrow_with_params(sql, params, options, None)
+            .await
     }
 }

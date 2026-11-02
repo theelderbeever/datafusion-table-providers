@@ -15,6 +15,7 @@ limitations under the License.
 */
 pub mod arrow_sql_gen;
 pub mod conn;
+pub mod params;
 pub mod pool;
 
 use crate::conn::MySQLConnection;

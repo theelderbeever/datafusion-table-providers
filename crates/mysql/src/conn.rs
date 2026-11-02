@@ -2,6 +2,8 @@ use std::{any::Any, collections::HashMap, sync::Arc};
 
 use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
 
+use crate::params::to_mysql_params;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{QueryOptions, QueryParams};
 use crate::arrow_sql_gen::{self, columns_to_schema, map_column_to_data_type, rows_to_arrow};
 use datafusion::arrow::array::{RecordBatch, RecordBatchOptions};
 use async_stream::stream;
@@ -218,6 +220,19 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
         self.query_stream(sql, Params::from(params_vec), projected_schema)
             .await
+    }
+
+    /// Binds positional (`?`) or named (`:name`) parameters. Settings are rejected;
+    /// `query_id` is ignored.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        let params = to_mysql_params(params, options)?;
+        self.query_stream(sql, params, projected_schema).await
     }
 
     async fn execute(&self, query: &str, params: &[&'a (dyn ToValue + Sync)]) -> Result<u64> {
