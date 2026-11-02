@@ -1,4 +1,5 @@
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::indexes::{IndexDiscovery, IndexInfo};
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
 use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -347,5 +348,87 @@ impl NativeQueryExecutor for CassandraConnectionPool {
         self.connect_direct()
             .query_arrow_with_params(sql, params, options, None)
             .await
+    }
+}
+
+/// Lists a table's primary key (partition key columns followed by clustering columns, as an
+/// index named `PRIMARY` of kind `primary_key`) and its secondary indexes from
+/// `system_schema.indexes` (`kind` is `COMPOSITES`, `KEYS` or `CUSTOM`; `columns` holds the
+/// index `target`; `definition` the custom index class, if any). The keyspace defaults to
+/// the session's keyspace.
+#[async_trait]
+impl IndexDiscovery for CassandraConnectionPool {
+    async fn indexes(
+        &self,
+        table: &TableReference,
+    ) -> std::result::Result<Vec<IndexInfo>, GenericError> {
+        use futures::TryStreamExt;
+
+        let keyspace = match table.schema() {
+            Some(keyspace) => keyspace.to_string(),
+            None => match self.session.get_keyspace() {
+                Some(keyspace) => keyspace.to_string(),
+                None => return Ok(Vec::new()),
+            },
+        };
+
+        let mut columns: Vec<(String, String, i32)> = self
+            .session
+            .query_iter(
+                "SELECT column_name, kind, position FROM system_schema.columns \
+                 WHERE keyspace_name = ? AND table_name = ?",
+                (&keyspace, table.table()),
+            )
+            .await?
+            .rows_stream::<(String, String, i32)>()?
+            .try_collect()
+            .await?;
+        columns.sort_by_key(|(_, kind, position)| (kind != "partition_key", *position));
+        let key: Vec<String> = columns
+            .into_iter()
+            .filter(|(_, kind, _)| kind == "partition_key" || kind == "clustering")
+            .map(|(name, _, _)| name)
+            .collect();
+
+        let mut indexes = Vec::new();
+        if !key.is_empty() {
+            indexes.push(IndexInfo {
+                name: "PRIMARY".to_string(),
+                columns: key,
+                unique: true,
+                primary: true,
+                kind: Some("primary_key".to_string()),
+                definition: None,
+            });
+        }
+
+        let mut secondary: Vec<(String, String, Option<std::collections::HashMap<String, String>>)> =
+            self.session
+                .query_iter(
+                    "SELECT index_name, kind, options FROM system_schema.indexes \
+                     WHERE keyspace_name = ? AND table_name = ?",
+                    (&keyspace, table.table()),
+                )
+                .await?
+                .rows_stream::<(
+                    String,
+                    String,
+                    Option<std::collections::HashMap<String, String>>,
+                )>()?
+                .try_collect()
+                .await?;
+        secondary.sort_by(|a, b| a.0.cmp(&b.0));
+        indexes.extend(secondary.into_iter().map(|(name, kind, options)| {
+            let options = options.unwrap_or_default();
+            IndexInfo {
+                name,
+                columns: options.get("target").cloned().into_iter().collect(),
+                unique: false,
+                primary: false,
+                kind: Some(kind),
+                definition: options.get("class_name").cloned(),
+            }
+        }));
+        Ok(indexes)
     }
 }
