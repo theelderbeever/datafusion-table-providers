@@ -1,4 +1,5 @@
 use crate::conn::{PostgresConnection, PostgresPooledConnection};
+use datafusion_table_providers_common::sql::db_connection_pool::indexes::{IndexDiscovery, IndexInfo};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
 use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
@@ -899,5 +900,54 @@ impl NativeQueryExecutor for PostgresConnectionPool {
         let conn = self.connect_direct().await?;
         conn.query_arrow_with_params(sql, params, options, None)
             .await
+    }
+}
+
+const INDEXES_QUERY: &str = r"
+SELECT
+    i.relname AS name,
+    ARRAY(
+        SELECT pg_catalog.pg_get_indexdef(x.indexrelid, k, true)
+        FROM generate_series(1, x.indnkeyatts) AS k
+        ORDER BY k
+    ) AS columns,
+    x.indisunique AS is_unique,
+    x.indisprimary AS is_primary,
+    am.amname AS kind,
+    pg_catalog.pg_get_indexdef(x.indexrelid) AS definition
+FROM pg_catalog.pg_index x
+JOIN pg_catalog.pg_class c ON c.oid = x.indrelid
+JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_am am ON am.oid = i.relam
+WHERE n.nspname = $1 AND c.relname = $2
+ORDER BY x.indisprimary DESC, i.relname
+";
+
+/// Lists the indexes of a table from `pg_index`. The schema defaults to `public`. Columns
+/// are the key columns (expressions for expression indexes); `INCLUDE` columns are omitted.
+#[async_trait]
+impl IndexDiscovery for PostgresConnectionPool {
+    async fn indexes(
+        &self,
+        table: &TableReference,
+    ) -> std::result::Result<Vec<IndexInfo>, GenericError> {
+        let conn = self.connect_direct().await?;
+        let schema = table.schema().unwrap_or("public");
+        let rows = conn
+            .conn
+            .query(INDEXES_QUERY, &[&schema, &table.table()])
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|row| IndexInfo {
+                name: row.get("name"),
+                columns: row.get("columns"),
+                unique: row.get("is_unique"),
+                primary: row.get("is_primary"),
+                kind: row.get("kind"),
+                definition: row.get("definition"),
+            })
+            .collect())
     }
 }
