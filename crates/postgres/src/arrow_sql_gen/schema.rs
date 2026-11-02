@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::hive_schema;
 use crate::conn::PostgresVariant;
-use datafusion_table_providers_common::UnsupportedTypeAction;
 
 /// The largest precision that fits `Decimal128`.
 pub(crate) const MAX_DECIMAL128_PRECISION: u16 = 38;
@@ -50,24 +49,14 @@ pub(crate) fn numeric_typmod_precision_scale(typmod: i32) -> Option<(u16, i8)> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParseContext {
-    pub(crate) unsupported_type_action: UnsupportedTypeAction,
     pub(crate) type_details: Option<serde_json::Value>,
 }
 
 impl ParseContext {
     pub(crate) fn new() -> Self {
         Self {
-            unsupported_type_action: UnsupportedTypeAction::Error,
             type_details: None,
         }
-    }
-
-    pub(crate) fn with_unsupported_type_action(
-        mut self,
-        unsupported_type_action: UnsupportedTypeAction,
-    ) -> Self {
-        self.unsupported_type_action = unsupported_type_action;
-        self
     }
 
     pub(crate) fn with_type_details(mut self, type_details: serde_json::Value) -> Self {
@@ -126,7 +115,7 @@ pub(crate) fn pg_data_type_to_arrow_type(
         "inet" | "cidr" | "macaddr" => Ok(DataType::Utf8),
         "bit" | "bit varying" => Ok(DataType::Binary),
         "tsvector" | "tsquery" => Ok(DataType::LargeUtf8),
-        "xml" | "json" => Ok(DataType::Utf8),
+        "xml" | "json" | "jsonb" => Ok(DataType::Utf8),
         "aclitem" | "pg_node_tree" => Ok(DataType::Utf8),
         "array" => parse_array_type(context, variant),
         "anyarray" => Ok(DataType::List(Arc::new(Field::new(
@@ -141,10 +130,6 @@ pub(crate) fn pg_data_type_to_arrow_type(
         "composite" => parse_composite_type(context, variant),
         "geometry" | "geography" => Ok(DataType::Binary),
 
-        // `jsonb` is currently not supported, but if the user has set the `UnsupportedTypeAction` to `String` we'll return `Utf8`.
-        "jsonb" if context.unsupported_type_action == UnsupportedTypeAction::String => {
-            Ok(DataType::Utf8)
-        }
         // Redshift external tables (`CREATE EXTERNAL TABLE`, Redshift Spectrum) report
         // column types from the backing catalog (e.g. AWS Glue / Hive Metastore), which
         // use Hive type names — including complex types like `array<struct<...>>`,
@@ -634,11 +619,8 @@ mod tests {
             DataType::Utf8
         );
 
-        let jsonb_context = context
-            .clone()
-            .with_unsupported_type_action(UnsupportedTypeAction::String);
         assert_eq!(
-            pg_data_type_to_arrow_type("jsonb", &jsonb_context, None)
+            pg_data_type_to_arrow_type("jsonb", &context, None)
                 .expect("Failed to convert jsonb"),
             DataType::Utf8
         );

@@ -580,7 +580,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         None => builder.append_null(),
                     }
                 }
-                // Schema validation will only allow JSONB columns when `UnsupportedTypeAction` is set to `String`, so it is safe to handle JSONB here as strings.
+                // Preserve the server's JSON representation without parsing or reserializing.
                 Type::JSON | Type::JSONB => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
@@ -934,8 +934,8 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     ListBuilder<Float64Builder>,
                     f64
                 ),
-                Type::TEXT_ARRAY => handle_primitive_array_type!(
-                    Type::TEXT_ARRAY,
+                Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => handle_primitive_array_type!(
+                    postgres_type.clone(),
                     builder,
                     row,
                     i,
@@ -1294,7 +1294,7 @@ pub(crate) fn map_column_type_to_data_type(column_type: &Type, field_name: &str)
         }
         Type::BYTEA => Ok(Some(DataType::Binary)),
         Type::BOOL => Ok(Some(DataType::Boolean)),
-        // Schema validation will only allow JSONB columns when `UnsupportedTypeAction` is set to `String`, so it is safe to handle JSONB here as strings.
+        // Preserve the server's JSON representation without parsing or reserializing.
         Type::JSON | Type::JSONB => Ok(Some(DataType::Utf8)),
         // Precision and scale come from the type modifier; see `numeric_column_type`.
         Type::NUMERIC => Ok(Some(DataType::Utf8)),
@@ -1348,7 +1348,7 @@ pub(crate) fn map_column_type_to_data_type(column_type: &Type, field_name: &str)
             DataType::Float64,
             true,
         ))))),
-        Type::TEXT_ARRAY => Ok(Some(DataType::List(Arc::new(Field::new(
+        Type::TEXT_ARRAY | Type::VARCHAR_ARRAY => Ok(Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Utf8,
             true,

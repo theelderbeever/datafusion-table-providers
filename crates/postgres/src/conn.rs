@@ -427,8 +427,7 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
 
         let mut fields = Vec::new();
         for column in columns {
-            let mut context =
-                ParseContext::new().with_unsupported_type_action(self.unsupported_type_action);
+            let mut context = ParseContext::new();
 
             if let Some(type_details) = column.type_details {
                 context = context.with_type_details(type_details);

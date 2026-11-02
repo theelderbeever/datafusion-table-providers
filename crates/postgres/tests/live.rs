@@ -169,3 +169,111 @@ async fn index_discovery() {
     assert_eq!(indexes[1].columns, vec!["lower(a)".to_string()]);
     assert_eq!(indexes[1].kind.as_deref(), Some("btree"));
 }
+
+#[tokio::test]
+async fn varchar_arrays_and_json_preserve_values_and_schemas() {
+    let Some(pool) = pool().await else {
+        eprintln!("POSTGRES_TEST_PORT not set; skipping");
+        return;
+    };
+    let params = QueryParams::new();
+    let sql = "SELECT a, j, b FROM (VALUES \
+        (ARRAY['alpha', NULL, 'é']::varchar[], '{\"key\": [1, null]}'::json, '{\"key\": [1, null]}'::jsonb), \
+        (ARRAY[]::varchar[], 'null'::json, 'null'::jsonb), \
+        (NULL::varchar[], NULL::json, NULL::jsonb)) AS v(a,j,b)";
+    let (schema, batches) = run(&pool, sql, &params).await;
+    assert_eq!(
+        schema.field(0).data_type(),
+        &DataType::List(std::sync::Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Utf8, true)
+        ))
+    );
+    for (i, native) in [(0, "_varchar"), (1, "json"), (2, "jsonb")] {
+        assert_eq!(
+            schema
+                .field(i)
+                .metadata()
+                .get(SOURCE_TYPE_METADATA_KEY)
+                .map(String::as_str),
+            Some(native)
+        );
+    }
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(batch.schema(), schema);
+    let arrays = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    let first = arrays.value(0);
+    let first = first.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        first.iter().collect::<Vec<_>>(),
+        vec![Some("alpha"), None, Some("é")]
+    );
+    assert_eq!(arrays.value_length(1), 0);
+    assert!(arrays.is_null(2));
+    let json = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(json.value(0), "{\"key\": [1, null]}");
+    assert_eq!(json.value(1), "null");
+    assert!(json.is_null(2));
+    let jsonb = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(jsonb.value(0), "{\"key\": [1, null]}");
+    assert_eq!(jsonb.value(1), "null");
+    assert!(jsonb.is_null(2));
+
+    let (empty_schema, empty) = run(
+        &pool,
+        &format!("SELECT * FROM ({sql}) q WHERE false"),
+        &params,
+    )
+    .await;
+    assert_eq!(empty_schema, schema);
+    assert!(empty.iter().all(|batch| batch.num_rows() == 0));
+
+    let (stream_schema, streamed) = run(
+        &pool,
+        &format!("SELECT q.* FROM ({sql}) q CROSS JOIN generate_series(1, 3000)"),
+        &params,
+    )
+    .await;
+    assert_eq!(stream_schema, schema);
+    assert!(streamed.len() > 1);
+    assert_eq!(
+        streamed.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        9000
+    );
+    for batch in &streamed {
+        assert_eq!(batch.schema(), schema);
+    }
+
+    // Catalog inference must accept JSONB under the default unsupported-type policy.
+    run(
+        &pool,
+        "CREATE TABLE quill_json_array_types (a varchar[], j json, b jsonb)",
+        &params,
+    )
+    .await;
+    let pool = std::sync::Arc::new(pool);
+    let factory = datafusion_table_providers_postgres::PostgresTableFactory::new(pool.clone());
+    let result = factory
+        .table_provider(TableReference::partial("public", "quill_json_array_types"))
+        .await;
+    run(&pool, "DROP TABLE quill_json_array_types", &params).await;
+    let table = result.expect("catalog schema supports varchar arrays and JSON/JSONB");
+    assert_eq!(
+        table.schema().field(0).data_type(),
+        schema.field(0).data_type()
+    );
+    assert_eq!(table.schema().field(1).data_type(), &DataType::Utf8);
+    assert_eq!(table.schema().field(2).data_type(), &DataType::Utf8);
+}
