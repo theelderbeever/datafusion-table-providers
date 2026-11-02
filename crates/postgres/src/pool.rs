@@ -13,7 +13,7 @@ use datafusion_table_providers_common::{
     util::{self, ns_lookup::verify_ns_lookup_and_tcp_connect},
     UnsupportedTypeAction,
 };
-use native_tls::{Certificate, TlsConnector};
+use native_tls::{Certificate, Identity, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use snafu::{prelude::*, ResultExt};
@@ -70,6 +70,26 @@ pub enum Error {
         "Certificate loading failed.\n{source}\nEnsure the root certificate path points to a valid certificate."
     ))]
     FailedToLoadCertError { source: native_tls::Error },
+
+    #[snafu(display(
+        "Invalid client certificate or key path: {path}. Ensure 'sslcert' and 'sslkey' point to PEM files."
+    ))]
+    InvalidClientCertPathError { path: String },
+
+    #[snafu(display(
+        "'sslcert' and 'sslkey' must be provided together for client certificate authentication."
+    ))]
+    IncompleteClientIdentityError,
+
+    #[snafu(display(
+        "Failed to read the client certificate or key.\n{source}"
+    ))]
+    FailedToReadClientIdentityError { source: std::io::Error },
+
+    #[snafu(display(
+        "Failed to load the client certificate and key.\n{source}\nEnsure 'sslcert' is a PEM certificate (chain) and 'sslkey' a PEM PKCS#8 private key ('BEGIN PRIVATE KEY')."
+    ))]
+    FailedToLoadClientIdentityError { source: native_tls::Error },
 
     #[snafu(display("TLS connector initialization failed.\n{source}\nVerify SSL mode and root certificate validity"))]
     FailedToBuildTlsConnectorError { source: native_tls::Error },
@@ -343,6 +363,23 @@ impl PostgresConnectionPool {
             ssl_rootcert_path = Some(PathBuf::from(pg_sslrootcert));
         }
 
+        // Client certificate authentication (mTLS): `sslcert`/`sslkey` from the parameters
+        // take precedence over the connection string.
+        let (conn_str_cert, conn_str_key) = params
+            .get("connection_string")
+            .map(SecretBox::expose_secret)
+            .map(|s| extract_client_cert_params(s))
+            .unwrap_or_default();
+        let ssl_cert_path = params
+            .get("sslcert")
+            .map(|v| v.expose_secret().to_string())
+            .or(conn_str_cert);
+        let ssl_key_path = params
+            .get("sslkey")
+            .map(|v| v.expose_secret().to_string())
+            .or(conn_str_key);
+        let identity = load_client_identity(ssl_cert_path, ssl_key_path).await?;
+
         let mode = match ssl_mode.as_str() {
             "disable" => "disable",
             "prefer" => "prefer",
@@ -367,7 +404,7 @@ impl PostgresConnectionPool {
             certs = Some(parse_certs(&buf)?);
         }
 
-        let tls_connector = get_tls_connector(ssl_mode.as_str(), certs)?;
+        let tls_connector = get_tls_connector(ssl_mode.as_str(), certs, identity)?;
         let connector = MakeTlsConnector::new(tls_connector);
 
         // Resolve the password provider: use the caller's, wrap the static password,
@@ -504,6 +541,8 @@ fn parse_connection_string(
                 "sslrootcert" => {
                     ssl_rootcert_path = Some(value.to_string());
                 }
+                // Handled by `extract_client_cert_params`.
+                "sslcert" | "sslkey" => {}
                 "password" => {
                     password = Some(value.to_string());
                 }
@@ -607,11 +646,61 @@ async fn verify_postgres_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn get_tls_connector(ssl_mode: &str, rootcerts: Option<Vec<Certificate>>) -> Result<TlsConnector> {
+/// Extracts `sslcert` and `sslkey` from a libpq-style connection string.
+fn extract_client_cert_params(pg_connection_string: &str) -> (Option<String>, Option<String>) {
+    let mut cert = None;
+    let mut key = None;
+    for param in pg_connection_string.split_whitespace() {
+        match param.split_once('=') {
+            Some(("sslcert", v)) => cert = Some(v.to_string()),
+            Some(("sslkey", v)) => key = Some(v.to_string()),
+            _ => {}
+        }
+    }
+    (cert, key)
+}
+
+/// Loads a client identity from PEM files: `cert_path` holds the certificate (optionally
+/// followed by its chain) and `key_path` a PKCS#8 private key. Both or neither must be set.
+async fn load_client_identity(
+    cert_path: Option<String>,
+    key_path: Option<String>,
+) -> Result<Option<Identity>> {
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => (cert, key),
+        _ => return IncompleteClientIdentitySnafu.fail(),
+    };
+    for path in [&cert_path, &key_path] {
+        ensure!(
+            std::path::Path::new(path).exists(),
+            InvalidClientCertPathSnafu { path: path.clone() }
+        );
+    }
+    let cert = tokio::fs::read(&cert_path)
+        .await
+        .context(FailedToReadClientIdentitySnafu)?;
+    let key = tokio::fs::read(&key_path)
+        .await
+        .context(FailedToReadClientIdentitySnafu)?;
+    Identity::from_pkcs8(&cert, &key)
+        .map(Some)
+        .context(FailedToLoadClientIdentitySnafu)
+}
+
+fn get_tls_connector(
+    ssl_mode: &str,
+    rootcerts: Option<Vec<Certificate>>,
+    identity: Option<Identity>,
+) -> Result<TlsConnector> {
     let mut builder = TlsConnector::builder();
 
     if ssl_mode == "disable" {
         return builder.build().context(FailedToBuildTlsConnectorSnafu);
+    }
+
+    if let Some(identity) = identity {
+        builder.identity(identity);
     }
 
     if let Some(certs) = rootcerts {
@@ -704,6 +793,29 @@ impl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_client_cert_params() {
+        let (cert, key) =
+            extract_client_cert_params("host=h sslcert=/c.pem sslkey=/k.pem sslmode=verify-full");
+        assert_eq!(cert.as_deref(), Some("/c.pem"));
+        assert_eq!(key.as_deref(), Some("/k.pem"));
+        let (conn_str, ..) = parse_connection_string("host=h sslcert=/c.pem sslkey=/k.pem");
+        assert_eq!(conn_str.trim(), "host=h");
+    }
+
+    #[tokio::test]
+    async fn client_identity_requires_cert_and_key() {
+        assert!(load_client_identity(None, None).await.unwrap().is_none());
+        assert!(matches!(
+            load_client_identity(Some("/c.pem".into()), None).await,
+            Err(Error::IncompleteClientIdentityError)
+        ));
+        assert!(matches!(
+            load_client_identity(Some("/nope/c.pem".into()), Some("/nope/k.pem".into())).await,
+            Err(Error::InvalidClientCertPathError { .. })
+        ));
+    }
     use secrecy::ExposeSecret;
 
     #[tokio::test]
