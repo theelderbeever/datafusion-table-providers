@@ -1,5 +1,6 @@
 pub mod arrow_sql_gen;
 pub mod conn;
+pub mod params;
 pub mod pool;
 
 use crate::arrow_sql_gen::statement_ext::CreateTableBuilderPostgresExt;

@@ -1,4 +1,7 @@
 use crate::conn::{PostgresConnection, PostgresPooledConnection};
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use arrow::datatypes::SchemaRef;
 use datafusion::common::TableReference;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc};
@@ -770,5 +773,19 @@ mod tests {
 
         assert_eq!(config.get_options(), None);
         assert_eq!(config.get_application_name(), None);
+    }
+}
+
+#[async_trait]
+impl NativeQueryExecutor for PostgresConnectionPool {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> std::result::Result<SendableRecordBatchStream, GenericError> {
+        let conn = self.connect_direct().await?;
+        conn.query_arrow_with_params(sql, params, options, None)
+            .await
     }
 }

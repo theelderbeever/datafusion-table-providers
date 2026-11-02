@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::arrow_sql_gen::rows_to_arrow;
 use crate::arrow_sql_gen::schema::pg_data_type_to_arrow_type;
 use crate::arrow_sql_gen::schema::ParseContext;
+use crate::params::to_pg_params;
 use crate::pool::ConnectionManager;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{QueryOptions, QueryParams};
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
@@ -469,6 +471,19 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
     ) -> Result<SendableRecordBatchStream> {
         self.query_stream(sql, params.iter().copied(), projected_schema)
             .await
+    }
+
+    /// Binds `params` positionally (`$1`, `$2`, ...). Named parameters and settings are
+    /// rejected; `query_id` is ignored.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        let params = to_pg_params(params, options)?;
+        self.query_stream(sql, params.iter(), projected_schema).await
     }
 
     async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
