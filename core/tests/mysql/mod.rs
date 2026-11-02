@@ -676,7 +676,19 @@ async fn arrow_mysql_one_way(
     );
 
     assert_eq!(record_batch.len(), 1);
-    assert_eq!(record_batch[0], expected_record);
+    // Result fields carry source metadata (`source_type`); compare without it.
+    let fields: Vec<_> = record_batch[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_metadata(std::collections::HashMap::new()))
+        .collect();
+    let actual = RecordBatch::try_new(
+        Arc::new(arrow::datatypes::Schema::new(fields)),
+        record_batch[0].columns().to_vec(),
+    )
+    .expect("record batch without field metadata");
+    assert_eq!(actual, expected_record);
 
     record_batch
 }

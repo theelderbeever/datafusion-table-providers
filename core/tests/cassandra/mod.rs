@@ -779,9 +779,9 @@ async fn test_cassandra_connection_pool_with_schema(port: u16) {
     assert_eq!(
         inferred.as_ref(),
         &Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("age", DataType::Int32, true),
-            Field::new("name", DataType::Utf8, true),
+            Field::new("id", DataType::Int32, true).with_metadata(std::collections::HashMap::from([(datafusion_table_providers::SOURCE_TYPE_METADATA_KEY.to_string(), "int".to_string())])),
+            Field::new("age", DataType::Int32, true).with_metadata(std::collections::HashMap::from([(datafusion_table_providers::SOURCE_TYPE_METADATA_KEY.to_string(), "int".to_string())])),
+            Field::new("name", DataType::Utf8, true).with_metadata(std::collections::HashMap::from([(datafusion_table_providers::SOURCE_TYPE_METADATA_KEY.to_string(), "text".to_string())])),
         ])
     );
 

@@ -1,7 +1,7 @@
 use crate::{arrow_record_batch_gen::*, docker::ContainerManager};
 use arrow::{
     array::{
-        Array, Decimal128Array, Decimal128Builder, Int32Array, Int64Array, ListArray, ListBuilder,
+        Array, Decimal128Array, Decimal128Builder, Int32Array, StringBuilder, Int64Array, ListArray, ListBuilder,
         RecordBatch, StringArray, StructArray, UInt64Array,
     },
     datatypes::{DataType, Field, Schema, SchemaRef},
@@ -513,11 +513,11 @@ async fn test_postgres_connection_pool_with_schema(port: u16) {
 }
 
 /// An unconstrained `numeric` column (what `max()`, `avg()` and arithmetic over `numeric`
-/// return) has no fixed scale, so the Arrow column scale must not be taken from the first
-/// row: every later row carrying more decimals was rounded down to it.
+/// return) has no fixed scale, so no Arrow decimal can hold it exactly: it is returned as the
+/// Postgres text rendering, independent of row order.
 ///
-/// The fixture order matters — a whole number first, longer values after. Ordered the other
-/// way round the values happen to survive even without the fix.
+/// The fixture order matters — a whole number first, longer values after: taking the scale
+/// from the first row would round the later ones.
 async fn test_postgres_unconstrained_numeric_precision(port: u16) {
     let pool = common::get_postgres_connection_pool(port)
         .await
@@ -526,7 +526,7 @@ async fn test_postgres_unconstrained_numeric_precision(port: u16) {
     let conn = sqltable_pool.connect().await.expect("connect should work");
     let async_conn = conn.as_async().expect("should be async connection");
 
-    // No projected schema: the scale can only come from the column itself.
+    // No projected schema: the type can only come from the column itself.
     let stream = async_conn
         .query_arrow(
             "SELECT v FROM (VALUES (20::numeric),(17.685::numeric),(15.334::numeric)) t(v)",
@@ -541,34 +541,32 @@ async fn test_postgres_unconstrained_numeric_precision(port: u16) {
         .collect::<Result<Vec<_>, _>>()
         .expect("batches should be readable");
 
-    let scale: u32 = 20;
-    let expected: Vec<i128> = vec![
-        20 * 10i128.pow(scale),
-        17_685 * 10i128.pow(scale - 3),
-        15_334 * 10i128.pow(scale - 3),
-    ];
-
-    let got: Vec<i128> = batches
+    let got: Vec<String> = batches
         .iter()
         .flat_map(|batch| {
+            let field = batch.schema().field(0).clone();
+            assert_eq!(
+                field
+                    .metadata()
+                    .get(datafusion_table_providers::SOURCE_ENCODING_METADATA_KEY)
+                    .map(String::as_str),
+                Some("text"),
+                "unconstrained numeric is carried as text"
+            );
             let column = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("v should be Decimal128");
-            assert_eq!(
-                column.scale(),
-                20,
-                "unconstrained numeric must use the fixed default scale, not the first row's"
-            );
+                .downcast_ref::<StringArray>()
+                .expect("v should be Utf8");
             (0..column.len())
-                .map(|i| column.value(i))
+                .map(|i| column.value(i).to_string())
                 .collect::<Vec<_>>()
         })
         .collect();
 
     assert_eq!(
-        got, expected,
+        got,
+        vec!["20", "17.685", "15.334"],
         "every numeric value must survive exactly, independent of row order"
     );
 }
@@ -768,32 +766,25 @@ async fn test_postgres_numeric_type(port: u16) {
 (1.0917217805754313, 52.9533333333333333);
     ";
 
+    // Unconstrained `numeric` is carried as the Postgres text rendering.
     let schema = Arc::new(Schema::new(vec![
-        Field::new("first_column", DataType::Decimal128(38, 20), true),
-        Field::new("second_column", DataType::Decimal128(38, 20), true),
+        Field::new("first_column", DataType::Utf8, true),
+        Field::new("second_column", DataType::Utf8, true),
     ]));
 
     let expected_record = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(
-                Decimal128Array::from(vec![
-                    109172178057543130000i128,
-                    97824560830666753739i128,
-                    109172178057543130000i128,
-                ])
-                .with_precision_and_scale(38, 20)
-                .unwrap(),
-            ),
-            Arc::new(
-                Decimal128Array::from(vec![
-                    0i128,
-                    122091750000000000000000i128,
-                    5295333333333333330000i128,
-                ])
-                .with_precision_and_scale(38, 20)
-                .unwrap(),
-            ),
+            Arc::new(StringArray::from(vec![
+                "1.0917217805754313",
+                "0.97824560830666753739",
+                "1.0917217805754313",
+            ])),
+            Arc::new(StringArray::from(vec![
+                "0.00000000000000000000",
+                "1220.9175000000000000",
+                "52.9533333333333333",
+            ])),
         ],
     )
     .expect("Failed to created arrow record batch");
@@ -824,39 +815,22 @@ async fn test_postgres_numeric_array_type(port: u16) {
 (ARRAY[100.1::NUMERIC]);
     ";
 
-    let decimal_item_type = DataType::Decimal128(38, 20);
+    // Unconstrained `numeric[]` elements are carried as the Postgres text rendering.
     let schema = Arc::new(Schema::new(vec![Field::new(
         "numeric_values",
-        DataType::List(Arc::new(Field::new(
-            "item",
-            decimal_item_type.clone(),
-            true,
-        ))),
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
         true,
     )]));
 
-    let mut numeric_array_builder = ListBuilder::new(
-        Decimal128Builder::new()
-            .with_precision_and_scale(38, 20)
-            .expect("Failed to create Decimal128Builder with expected precision and scale"),
-    );
-
-    numeric_array_builder
-        .values()
-        .append_value(123000000000000000000);
-    numeric_array_builder
-        .values()
-        .append_value(4200000000000000000000);
+    let mut numeric_array_builder = ListBuilder::new(StringBuilder::new());
+    numeric_array_builder.values().append_value("1.2300");
+    numeric_array_builder.values().append_value("42");
     numeric_array_builder.values().append_null();
-    numeric_array_builder
-        .values()
-        .append_value(-450000000000000000);
+    numeric_array_builder.values().append_value("-0.0045");
     numeric_array_builder.append(true);
     numeric_array_builder.append_null();
     numeric_array_builder.append(true);
-    numeric_array_builder
-        .values()
-        .append_value(10010000000000000000000);
+    numeric_array_builder.values().append_value("100.1");
     numeric_array_builder.append(true);
 
     let expected_record = RecordBatch::try_new(
@@ -1334,7 +1308,17 @@ async fn arrow_postgres_one_way(
     )
     .await;
 
-    assert_eq!(record_batch[0], expected_record);
+    // Result fields carry source metadata (`source_type`, ...); compare without it.
+    let actual = &record_batch[0];
+    let fields: Vec<_> = actual
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_metadata(HashMap::new()))
+        .collect();
+    let actual = RecordBatch::try_new(Arc::new(Schema::new(fields)), actual.columns().to_vec())
+        .expect("record batch without field metadata");
+    assert_eq!(actual, expected_record);
 }
 
 async fn query_postgres_one_way(
