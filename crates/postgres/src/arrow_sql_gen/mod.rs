@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use arrow::array::{
     new_null_array, Array, ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder,
-    Decimal128Builder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int16Builder,
+    Decimal128Builder, Decimal256Builder, FixedSizeListBuilder, Float32Builder, Float64Builder, Int16Builder,
     Int32Builder, Int64Builder, Int8Builder, IntervalMonthDayNanoBuilder, LargeBinaryBuilder,
-    LargeStringBuilder, ListBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
+    LargeStringBuilder, ListBuilder, NullBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
     StringDictionaryBuilder, StructBuilder, Time64NanosecondBuilder, TimestampNanosecondBuilder,
     UInt32Builder,
 };
@@ -19,10 +19,10 @@ use bigdecimal::BigDecimal;
 use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, Timelike, Utc};
 use composite::CompositeType;
+use numeric::{MantissaError, PgNumeric};
 use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
 use datafusion_table_providers_common::sql::arrow_sql_gen::statement::map_data_type_to_column_type;
 use geo_types::geometry::Point;
-use rust_decimal::Decimal;
 use sea_query::{Alias, ColumnType, SeaRc};
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,6 +33,7 @@ use tokio_postgres::{types::Type, Row};
 pub mod builder;
 pub mod composite;
 pub mod hive_schema;
+mod numeric;
 pub mod schema;
 pub mod statement_ext;
 
@@ -101,13 +102,22 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot represent the Postgres numeric value {value} in column '{column_name}' as Decimal128({precision}, {scale}): the value overflows 128 bits"
+        "Cannot represent the Postgres numeric value {value} in column '{column_name}' as a decimal with precision {precision} and scale {scale}: the value overflows"
     ))]
     DecimalOverflowsColumnScale {
         column_name: String,
         value: String,
         precision: u8,
-        scale: u32,
+        scale: i32,
+    },
+
+    #[snafu(display(
+        "The Postgres numeric value {value} in column '{column_name}' cannot be stored in {data_type}: NaN and infinity have no decimal representation"
+    ))]
+    NumericNotFinite {
+        column_name: String,
+        value: String,
+        data_type: String,
     },
 
     #[snafu(display(
@@ -116,7 +126,7 @@ pub enum Error {
     DecimalExceedsColumnScale {
         column_name: String,
         value: String,
-        scale: u32,
+        scale: i32,
     },
 
     #[snafu(display("The field '{field_name}' has an unsupported data type: {data_type}."))]
@@ -128,49 +138,142 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// The Arrow precision for a `numeric` column that declares none, taken from schema inference
-/// so the two paths cannot drift apart — see [`schema::DEFAULT_NUMERIC_PRECISION`].
-const DEFAULT_NUMERIC_PRECISION: u8 = schema::DEFAULT_NUMERIC_PRECISION;
-
-/// The scale for such a column, as the unsigned column scale this decode path carries. Same
-/// source of truth as the precision above; [`schema::DEFAULT_NUMERIC_SCALE`] documents why it
-/// is pinned rather than inferred from the first row.
-const DEFAULT_UNCONSTRAINED_NUMERIC_SCALE: u32 = schema::DEFAULT_NUMERIC_SCALE as u32;
-
-/// Returns the `Decimal128` mantissa representing `value` in a column of scale `dest_scale`,
-/// without losing precision.
+/// Resolves the Arrow type for a `numeric` column from the projected schema.
 ///
-/// `Decimal::rescale` is deliberately not used: it rounds when narrowing (the cause of the
-/// silent corruption this replaces) and refuses to widen past its own 96-bit mantissa. Both
-/// directions are handled explicitly here, and anything that cannot be represented exactly is
-/// reported as an error rather than quietly rounded.
-///
-/// `column_name` names the offending column in that error — a numeric that will not fit is a
-/// property of one column of the query, and a message without it leaves the user to guess which.
-fn decimal_to_i128_mantissa(value: Decimal, dest_scale: u32, column_name: &str) -> Result<i128> {
-    let value_scale = value.scale();
-    let mantissa = value.mantissa();
-
-    match dest_scale.cmp(&value_scale) {
-        std::cmp::Ordering::Equal => Ok(mantissa),
-        std::cmp::Ordering::Greater => {
-            let factor = 10i128.checked_pow(dest_scale - value_scale);
-            factor
-                .and_then(|factor| mantissa.checked_mul(factor))
-                .context(DecimalOverflowsColumnScaleSnafu {
-                    column_name,
-                    value: value.to_string(),
-                    precision: DEFAULT_NUMERIC_PRECISION,
-                    scale: dest_scale,
-                })
+/// The projected schema carries the declared precision and scale (from the table schema or
+/// the statement's type modifiers). Without one the column is treated as unconstrained and
+/// carried as text — see [`schema::numeric_to_arrow_type`].
+fn numeric_column_type(projected_field: Option<&Field>) -> DataType {
+    match projected_field.map(Field::data_type) {
+        Some(dt @ (DataType::Decimal128(_, _) | DataType::Decimal256(_, _) | DataType::Utf8)) => {
+            dt.clone()
         }
-        std::cmp::Ordering::Less => DecimalExceedsColumnScaleSnafu {
-            column_name,
-            value: value.to_string(),
-            scale: dest_scale,
-        }
-        .fail(),
+        _ => DataType::Utf8,
     }
+}
+
+fn numeric_array_element_type(projected_field: Option<&Field>) -> DataType {
+    match projected_field.map(Field::data_type) {
+        Some(DataType::List(inner) | DataType::LargeList(inner)) => {
+            numeric_column_type(Some(inner.as_ref()))
+        }
+        _ => DataType::Utf8,
+    }
+}
+
+fn numeric_builder(data_type: &DataType) -> Box<dyn ArrayBuilder> {
+    match data_type {
+        DataType::Decimal128(p, s) => Box::new(
+            Decimal128Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap_or_default(),
+        ),
+        DataType::Decimal256(p, s) => Box::new(
+            Decimal256Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap_or_default(),
+        ),
+        _ => Box::new(StringBuilder::new()),
+    }
+}
+
+fn numeric_list_builder(element_type: &DataType) -> Box<dyn ArrayBuilder> {
+    match element_type {
+        DataType::Decimal128(p, s) => Box::new(ListBuilder::new(
+            Decimal128Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap_or_default(),
+        )),
+        DataType::Decimal256(p, s) => Box::new(ListBuilder::new(
+            Decimal256Builder::new()
+                .with_precision_and_scale(*p, *s)
+                .unwrap_or_default(),
+        )),
+        _ => Box::new(ListBuilder::new(StringBuilder::new())),
+    }
+}
+
+fn mantissa_error(
+    err: MantissaError,
+    value: &PgNumeric,
+    column_name: &str,
+    data_type: &DataType,
+) -> Error {
+    let (precision, scale) = match data_type {
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => (*p, *s),
+        _ => (0, 0),
+    };
+    match err {
+        MantissaError::NotFinite => Error::NumericNotFinite {
+            column_name: column_name.to_string(),
+            value: value.to_text(),
+            data_type: data_type.to_string(),
+        },
+        MantissaError::ExceedsScale => Error::DecimalExceedsColumnScale {
+            column_name: column_name.to_string(),
+            value: value.to_text(),
+            scale: i32::from(scale),
+        },
+        MantissaError::Overflow => Error::DecimalOverflowsColumnScale {
+            column_name: column_name.to_string(),
+            value: value.to_text(),
+            precision,
+            scale: i32::from(scale),
+        },
+    }
+}
+
+/// Appends one `numeric` value to a builder created by [`numeric_builder`] (or the values
+/// builder of [`numeric_list_builder`]).
+fn append_numeric(
+    builder: &mut dyn ArrayBuilder,
+    data_type: &DataType,
+    value: Option<&PgNumeric>,
+    column_name: &str,
+    postgres_type: &Type,
+) -> Result<()> {
+    let downcast_err = || Error::FailedToDowncastBuilder {
+        postgres_type: format!("{postgres_type}"),
+    };
+    match data_type {
+        DataType::Decimal128(_, scale) => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Decimal128Builder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Some(v) => b.append_value(
+                    v.mantissa_i128(*scale)
+                        .map_err(|e| mantissa_error(e, v, column_name, data_type))?,
+                ),
+                None => b.append_null(),
+            }
+        }
+        DataType::Decimal256(_, scale) => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Decimal256Builder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Some(v) => b.append_value(
+                    v.mantissa(*scale)
+                        .map_err(|e| mantissa_error(e, v, column_name, data_type))?,
+                ),
+                None => b.append_null(),
+            }
+        }
+        _ => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Some(v) => b.append_value(v.to_text()),
+                None => b.append_null(),
+            }
+        }
+    }
+    Ok(())
 }
 
 macro_rules! handle_primitive_type {
@@ -206,14 +309,11 @@ macro_rules! handle_primitive_array_type {
             }
             .fail();
         };
-        let v: Option<Vec<$value_type>> = $row
+        let v: Option<Vec<Option<$value_type>>> = $row
             .try_get($i)
             .context(FailedToGetRowValueSnafu { pg_type: $type })?;
         match v {
-            Some(v) => {
-                let v = v.into_iter().map(Some);
-                builder.append_value(v);
-            }
+            Some(v) => builder.append_value(v),
             None => builder.append_null(),
         }
     }};
@@ -313,7 +413,6 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
     let mut postgres_types: Vec<Type> = Vec::new();
-    let mut postgres_numeric_scales: Vec<Option<u32>> = Vec::new();
     let mut column_names: Vec<String> = Vec::new();
     let mut projected_json_complex_fields: Vec<Option<Arc<Field>>> = Vec::new();
 
@@ -325,43 +424,21 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let projected_json_complex_field =
                 projected_json_complex_field(projected_schema, column_name, column_type);
 
-            let mut numeric_scale: Option<u32> = None;
-
-            let mut data_type = if *column_type == Type::NUMERIC {
-                if let Some(schema) = projected_schema.as_ref() {
-                    match get_decimal_column_precision_and_scale(column_name, schema) {
-                        Some((precision, scale)) => {
-                            numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
-                            Some(DataType::Decimal128(precision, scale))
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            } else if *column_type == Type::NUMERIC_ARRAY {
-                if let Some(schema) = projected_schema.as_ref() {
-                    match get_decimal_array_column_precision_and_scale(column_name, schema) {
-                        Some((precision, scale)) => {
-                            numeric_scale = Some(u32::try_from(scale).unwrap_or_default());
-                            Some(DataType::List(Arc::new(Field::new(
-                                "item",
-                                DataType::Decimal128(precision, scale),
-                                true,
-                            ))))
-                        }
-                        None => None,
-                    }
-                } else {
-                    None
-                }
-            } else {
-                map_column_type_to_data_type(column_type, column_name)?
-            };
-
             let projected_field = projected_schema
                 .as_ref()
                 .and_then(|schema| schema.field_with_name(column_name).ok());
+
+            let mut data_type = if *column_type == Type::NUMERIC {
+                Some(numeric_column_type(projected_field))
+            } else if *column_type == Type::NUMERIC_ARRAY {
+                Some(DataType::List(Arc::new(Field::new(
+                    "item",
+                    numeric_array_element_type(projected_field),
+                    true,
+                ))))
+            } else {
+                map_column_type_to_data_type(column_type, column_name)?
+            };
 
             let nullable = projected_field
                 .map(|field| field.is_nullable())
@@ -379,9 +456,14 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                 }
                 None => arrow_fields.push(None),
             }
-            postgres_numeric_scales.push(numeric_scale);
-            arrow_columns_builders
-                .push(map_data_type_to_array_builder_optional(data_type.as_ref()));
+            let builder = match (&data_type, column_type) {
+                (Some(dt), &Type::NUMERIC) => Some(numeric_builder(dt)),
+                (Some(DataType::List(inner)), &Type::NUMERIC_ARRAY) => {
+                    Some(numeric_list_builder(inner.data_type()))
+                }
+                _ => map_data_type_to_array_builder_optional(data_type.as_ref()),
+            };
+            arrow_columns_builders.push(builder);
             postgres_types.push(column_type.clone());
             column_names.push(column_name.to_string());
             projected_json_complex_fields.push(projected_json_complex_field);
@@ -396,10 +478,6 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
 
             let Some(arrow_field) = arrow_fields.get_mut(i) else {
                 return NoArrowFieldForIndexSnafu { index: i }.fail();
-            };
-
-            let Some(postgres_numeric_scale) = postgres_numeric_scales.get_mut(i) else {
-                return NoPostgresScaleForIndexSnafu { index: i }.fail();
             };
 
             match *postgres_type {
@@ -614,128 +692,81 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                     }
                 }
                 Type::NUMERIC => {
-                    let Some(column_name) = column_names.get(i) else {
-                        return NoColumnNameForIndexSnafu { index: i }.fail();
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let column_name = column_name.clone();
-                    let v: Option<Decimal> = row.try_get(i).context(FailedToGetRowValueSnafu {
+                    let Some(field) = arrow_field.as_ref() else {
+                        return NoArrowFieldForIndexSnafu { index: i }.fail();
+                    };
+                    let v: Option<PgNumeric> = row.try_get(i).context(FailedToGetRowValueSnafu {
                         pg_type: Type::NUMERIC,
                     })?;
-                    // A declared scale (`numeric(p,s)`) comes from the projected schema; a bare
-                    // `numeric` has no scale of its own, so use the pinned default rather than
-                    // the first row's scale, which later rows would then be rounded down to.
-                    let scale =
-                        postgres_numeric_scale.unwrap_or(DEFAULT_UNCONSTRAINED_NUMERIC_SCALE);
-
-                    let dec_builder = builder.get_or_insert_with(|| {
-                        Box::new(
-                            Decimal128Builder::new()
-                                .with_precision_and_scale(38, scale.try_into().unwrap_or_default())
-                                .unwrap_or_default(),
-                        )
-                    });
-
-                    let Some(dec_builder) =
-                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            postgres_type: format!("{postgres_type}"),
-                        }
-                        .fail();
-                    };
-
-                    if arrow_field.is_none() {
-                        let new_arrow_field = Field::new(
-                            &column_name,
-                            DataType::Decimal128(38, scale.try_into().unwrap_or_default()),
-                            true,
-                        );
-
-                        *arrow_field = Some(new_arrow_field);
-                    }
-
-                    if postgres_numeric_scale.is_none() {
-                        *postgres_numeric_scale = Some(scale);
-                    };
-
-                    let Some(v) = v else {
-                        dec_builder.append_null();
-                        continue;
-                    };
-
-                    dec_builder.append_value(decimal_to_i128_mantissa(v, scale, &column_name)?);
+                    append_numeric(
+                        builder.as_mut(),
+                        field.data_type(),
+                        v.as_ref(),
+                        &column_names[i],
+                        postgres_type,
+                    )?;
                 }
                 Type::NUMERIC_ARRAY => {
-                    let Some(column_name) = column_names.get(i) else {
-                        return NoColumnNameForIndexSnafu { index: i }.fail();
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
                     };
-                    let column_name = column_name.clone();
-                    let v: Option<Vec<Option<Decimal>>> =
+                    let element_type = match arrow_field.as_ref().map(Field::data_type) {
+                        Some(DataType::List(inner)) => inner.data_type().clone(),
+                        _ => return NoArrowFieldForIndexSnafu { index: i }.fail(),
+                    };
+                    let v: Option<Vec<Option<PgNumeric>>> =
                         row.try_get(i).context(FailedToGetRowValueSnafu {
                             pg_type: Type::NUMERIC_ARRAY,
                         })?;
 
-                    // As for scalar `numeric`: only a declared scale is trusted, otherwise the
-                    // pinned default, so the column's scale does not depend on the first row.
-                    let dest_scale =
-                        postgres_numeric_scale.unwrap_or(DEFAULT_UNCONSTRAINED_NUMERIC_SCALE);
-                    let decimal_scale = i8::try_from(dest_scale).unwrap_or_default();
-
-                    let decimal_array_builder = builder.get_or_insert_with(|| {
-                        Box::new(ListBuilder::new(
-                            Decimal128Builder::new()
-                                .with_precision_and_scale(38, decimal_scale)
-                                .unwrap_or_default(),
-                        ))
-                    });
-
-                    let Some(decimal_array_builder) = decimal_array_builder
-                        .as_any_mut()
-                        .downcast_mut::<ListBuilder<Decimal128Builder>>()
-                    else {
+                    macro_rules! append_numeric_list {
+                        ($values_builder:ty) => {{
+                            let Some(list_builder) = builder
+                                .as_any_mut()
+                                .downcast_mut::<ListBuilder<$values_builder>>()
+                            else {
+                                return FailedToDowncastBuilderSnafu {
+                                    postgres_type: format!("{postgres_type}"),
+                                }
+                                .fail();
+                            };
+                            match v {
+                                Some(values) => {
+                                    for item in &values {
+                                        append_numeric(
+                                            list_builder.values(),
+                                            &element_type,
+                                            item.as_ref(),
+                                            &column_names[i],
+                                            postgres_type,
+                                        )?;
+                                    }
+                                    list_builder.append(true);
+                                }
+                                None => list_builder.append_null(),
+                            }
+                        }};
+                    }
+                    match element_type {
+                        DataType::Decimal128(_, _) => append_numeric_list!(Decimal128Builder),
+                        DataType::Decimal256(_, _) => append_numeric_list!(Decimal256Builder),
+                        _ => append_numeric_list!(StringBuilder),
+                    }
+                }
+                Type::VOID => {
+                    let Some(builder) = builder else {
+                        return NoBuilderForIndexSnafu { index: i }.fail();
+                    };
+                    let Some(builder) = builder.as_any_mut().downcast_mut::<NullBuilder>() else {
                         return FailedToDowncastBuilderSnafu {
                             postgres_type: format!("{postgres_type}"),
                         }
                         .fail();
                     };
-
-                    if arrow_field.is_none() {
-                        let new_arrow_field = Field::new(
-                            &column_name,
-                            DataType::List(Arc::new(Field::new(
-                                "item",
-                                DataType::Decimal128(38, decimal_scale),
-                                true,
-                            ))),
-                            true,
-                        );
-
-                        *arrow_field = Some(new_arrow_field);
-                    }
-
-                    if postgres_numeric_scale.is_none() {
-                        *postgres_numeric_scale = Some(dest_scale);
-                    };
-
-                    let Some(values) = v else {
-                        decimal_array_builder.append_null();
-                        continue;
-                    };
-
-                    for item in values {
-                        if let Some(decimal) = item {
-                            decimal_array_builder
-                                .values()
-                                .append_value(decimal_to_i128_mantissa(
-                                    decimal,
-                                    dest_scale,
-                                    &column_name,
-                                )?);
-                        } else {
-                            decimal_array_builder.values().append_null();
-                        }
-                    }
-                    decimal_array_builder.append(true);
+                    builder.append_null();
                 }
                 Type::TIMESTAMP => {
                     let Some(builder) = builder else {
@@ -961,13 +992,13 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
                         }
                         .fail();
                     };
-                    let v: Option<Vec<GeometryFromSql>> =
+                    let v: Option<Vec<Option<GeometryFromSql>>> =
                         row.try_get(i).context(FailedToGetRowValueSnafu {
                             pg_type: postgres_type.clone(),
                         })?;
                     match v {
                         Some(v) => {
-                            let v = v.into_iter().map(|item| Some(item.wkb));
+                            let v = v.into_iter().map(|item| item.map(|item| item.wkb));
                             builder.append_value(v);
                         }
                         None => builder.append_null(),
@@ -1249,7 +1280,7 @@ fn decode_json_complex_column(
     }
 }
 
-fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<Option<DataType>> {
+pub(crate) fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<Option<DataType>> {
     match *column_type {
         Type::INT2 => Ok(Some(DataType::Int16)),
         Type::INT4 => Ok(Some(DataType::Int32)),
@@ -1265,10 +1296,13 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
         Type::BOOL => Ok(Some(DataType::Boolean)),
         // Schema validation will only allow JSONB columns when `UnsupportedTypeAction` is set to `String`, so it is safe to handle JSONB here as strings.
         Type::JSON | Type::JSONB => Ok(Some(DataType::Utf8)),
-        // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
-        Type::NUMERIC => Ok(None),
-        // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
-        Type::NUMERIC_ARRAY => Ok(None),
+        // Precision and scale come from the type modifier; see `numeric_column_type`.
+        Type::NUMERIC => Ok(Some(DataType::Utf8)),
+        Type::NUMERIC_ARRAY => Ok(Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))),
         Type::TIMESTAMPTZ => Ok(Some(DataType::Timestamp(
             TimeUnit::Nanosecond,
             Some(Arc::from("UTC")),
@@ -1283,6 +1317,7 @@ fn map_column_type_to_data_type(column_type: &Type, field_name: &str) -> Result<
             2,
         ))),
         Type::PG_NODE_TREE => Ok(Some(DataType::Utf8)),
+        Type::VOID => Ok(Some(DataType::Null)),
         Type::INT2_ARRAY => Ok(Some(DataType::List(Arc::new(Field::new(
             "item",
             DataType::Int16,
@@ -1556,33 +1591,6 @@ impl<'a> FromSql<'a> for XidFromSql {
     }
 }
 
-fn get_decimal_column_precision_and_scale(
-    column_name: &str,
-    projected_schema: &SchemaRef,
-) -> Option<(u8, i8)> {
-    let field = projected_schema.field_with_name(column_name).ok()?;
-    match field.data_type() {
-        DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
-        _ => None,
-    }
-}
-
-fn get_decimal_array_column_precision_and_scale(
-    column_name: &str,
-    projected_schema: &SchemaRef,
-) -> Option<(u8, i8)> {
-    let field = projected_schema.field_with_name(column_name).ok()?;
-    match field.data_type() {
-        DataType::List(inner_field) | DataType::LargeList(inner_field) => {
-            match inner_field.data_type() {
-                DataType::Decimal128(precision, scale) => Some((*precision, *scale)),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1592,6 +1600,7 @@ mod tests {
     };
     use geo_types::{point, polygon, Geometry};
     use geozero::{CoordDimensions, ToWkb};
+    use rust_decimal::Decimal;
     use std::str::FromStr;
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1618,57 +1627,6 @@ mod tests {
         let negative_result = Decimal::from_sql(&Type::NUMERIC, negative_raw.as_slice())
             .expect("Failed to run FromSql");
         assert_eq!(negative_result, negative);
-    }
-
-    /// Regression guard for the unconstrained `numeric` precision loss: values are widened
-    /// to the column scale exactly, and a value that would have to be rounded is rejected
-    /// instead of being silently truncated (the previous `Decimal::rescale` behaviour).
-    #[test]
-    fn test_decimal_to_i128_mantissa() {
-        // Whole number first, more decimals after: the fixture order that used to corrupt
-        // 17.685 into 18 and 15.334 into 15.
-        let scale = DEFAULT_UNCONSTRAINED_NUMERIC_SCALE;
-        for (value, expected) in [
-            ("20", 20 * 10i128.pow(20)),
-            ("17.685", 17_685 * 10i128.pow(17)),
-            ("15.334", 15_334 * 10i128.pow(17)),
-            ("-0.0045", -45 * 10i128.pow(16)),
-        ] {
-            let decimal = Decimal::from_str(value).expect("decimal parses");
-            assert_eq!(
-                decimal_to_i128_mantissa(decimal, scale, "reading")
-                    .expect("value is representable"),
-                expected,
-                "value {value} must be widened to scale {scale} exactly"
-            );
-        }
-
-        // A declared scale that already matches is passed through untouched.
-        let decimal = Decimal::from_str("1.23").expect("decimal parses");
-        assert_eq!(
-            decimal_to_i128_mantissa(decimal, 2, "reading").expect("value is representable"),
-            123
-        );
-
-        // More decimal places than the column can hold is an error, not a rounded value.
-        let decimal = Decimal::from_str("1.235").expect("decimal parses");
-        let error =
-            decimal_to_i128_mantissa(decimal, 2, "reading").expect_err("must not round silently");
-        assert!(
-            error.to_string().contains("more decimal places")
-                && error.to_string().contains("'reading'"),
-            "unexpected error: {error}"
-        );
-
-        // Widening that overflows 128 bits is reported rather than wrapped.
-        let decimal = Decimal::from_str("79228162514264337593543950335").expect("decimal parses");
-        let error =
-            decimal_to_i128_mantissa(decimal, DEFAULT_UNCONSTRAINED_NUMERIC_SCALE, "reading")
-                .expect_err("must not wrap");
-        assert!(
-            error.to_string().contains("overflows") && error.to_string().contains("'reading'"),
-            "unexpected error: {error}"
-        );
     }
 
     #[test]

@@ -12,7 +12,12 @@ use arrow::datatypes::Schema;
 use arrow::datatypes::SchemaRef;
 use arrow_schema::DataType;
 use async_stream::stream;
-use bb8_postgres::tokio_postgres::types::ToSql;
+use arrow::array::{RecordBatch, RecordBatchOptions};
+use bb8_postgres::tokio_postgres::types::{BorrowToSql, ToSql, Type};
+use bb8_postgres::tokio_postgres::Statement;
+use crate::arrow_sql_gen::map_column_type_to_data_type;
+use crate::arrow_sql_gen::schema::{numeric_to_arrow_type, numeric_typmod_precision_scale};
+use datafusion_table_providers_common::{SOURCE_ENCODING_METADATA_KEY, SOURCE_ENCODING_TEXT};
 use datafusion_table_providers_common::util::handle_unsupported_type_error;
 use datafusion_table_providers_common::util::schema::SchemaValidator;
 use datafusion_table_providers_common::UnsupportedTypeAction;
@@ -37,7 +42,6 @@ use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use futures::stream;
 use futures::StreamExt;
 
 use snafu::prelude::*;
@@ -444,11 +448,13 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
 
             // The Arrow mapping is lossy (`varchar(50)` and `citext` both land on
             // `Utf8`), so keep the source type the catalog reported alongside it.
-            fields.push(
-                Field::new(column.name, arrow_type, column.nullable).with_metadata(HashMap::from(
-                    [(SOURCE_TYPE_METADATA_KEY.to_string(), column.source_type)],
-                )),
-            );
+            let lowered = column.source_type.to_lowercase();
+            let is_numeric = lowered.starts_with("numeric") || lowered.starts_with("decimal");
+            fields.push(with_source_metadata_if(
+                Field::new(column.name, arrow_type, column.nullable),
+                column.source_type,
+                is_numeric,
+            ));
         }
 
         let schema = Arc::new(Schema::new(fields));
@@ -461,41 +467,163 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
         params: &[&'a (dyn ToSql + Sync)],
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
-        // TODO: We should have a way to detect if params have been passed
-        // if they haven't we should use .copy_out instead, because it should be much faster
+        self.query_stream(sql, params.iter().copied(), projected_schema)
+            .await
+    }
+
+    async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
+        Ok(self.conn.execute(sql, params).await?)
+    }
+}
+
+
+/// Builds the Arrow schema of a prepared statement's result from its column metadata, so
+/// that results with zero rows still carry their columns.
+///
+/// `numeric` precision and scale come from the column type modifier. Each field records the
+/// Postgres type name under [`SOURCE_TYPE_METADATA_KEY`], and columns carried as text get
+/// [`SOURCE_ENCODING_METADATA_KEY`].
+pub(crate) fn statement_schema(
+    stmt: &Statement,
+) -> std::result::Result<SchemaRef, crate::arrow_sql_gen::Error> {
+    let mut fields = Vec::with_capacity(stmt.columns().len());
+    for column in stmt.columns() {
+        let pg_type = column.type_();
+        let typmod = column.type_modifier();
+        let (data_type, source_type) = match *pg_type {
+            Type::NUMERIC | Type::NUMERIC_ARRAY => {
+                let precision_scale = numeric_typmod_precision_scale(typmod);
+                let base = match precision_scale {
+                    Some((p, s)) => format!("numeric({p},{s})"),
+                    None => "numeric".to_string(),
+                };
+                let numeric = numeric_to_arrow_type(precision_scale);
+                if *pg_type == Type::NUMERIC {
+                    (numeric, base)
+                } else {
+                    (
+                        DataType::List(Arc::new(Field::new("item", numeric, true))),
+                        format!("{base}[]"),
+                    )
+                }
+            }
+            _ => (
+                map_column_type_to_data_type(pg_type, column.name())?
+                    .unwrap_or(DataType::Utf8),
+                pg_type.name().to_string(),
+            ),
+        };
+        fields.push(with_source_metadata(
+            Field::new(column.name(), data_type, true),
+            source_type,
+            pg_type,
+        ));
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Attaches [`SOURCE_TYPE_METADATA_KEY`] and, for `numeric` columns carried as text,
+/// [`SOURCE_ENCODING_METADATA_KEY`].
+fn with_source_metadata(field: Field, source_type: String, pg_type: &Type) -> Field {
+    let is_numeric = matches!(*pg_type, Type::NUMERIC | Type::NUMERIC_ARRAY);
+    with_source_metadata_if(field, source_type, is_numeric)
+}
+
+fn with_source_metadata_if(field: Field, source_type: String, is_numeric: bool) -> Field {
+    let mut metadata = HashMap::from([(SOURCE_TYPE_METADATA_KEY.to_string(), source_type)]);
+    let is_text = match field.data_type() {
+        DataType::Utf8 => true,
+        DataType::List(inner) => inner.data_type() == &DataType::Utf8,
+        _ => false,
+    };
+    if is_numeric && is_text {
+        metadata.insert(
+            SOURCE_ENCODING_METADATA_KEY.to_string(),
+            SOURCE_ENCODING_TEXT.to_string(),
+        );
+    }
+    field.with_metadata(metadata)
+}
+
+/// Overlays the caller's projected fields (matched by name) onto the statement schema.
+fn overlay_projected(derived: &SchemaRef, projected: Option<&SchemaRef>) -> SchemaRef {
+    let Some(projected) = projected else {
+        return Arc::clone(derived);
+    };
+    let fields: Vec<Field> = derived
+        .fields()
+        .iter()
+        .map(|f| match projected.field_with_name(f.name()) {
+            Ok(p) => {
+                let mut metadata = f.metadata().clone();
+                metadata.extend(p.metadata().clone());
+                p.clone().with_metadata(metadata)
+            }
+            Err(_) => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
+/// Re-labels a decoded batch with the stream schema (adding source metadata), keeping the
+/// batch as decoded if the shapes differ.
+pub(crate) fn conform_batch(batch: RecordBatch, schema: &SchemaRef) -> RecordBatch {
+    let matches = batch.num_columns() == schema.fields().len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .all(|(a, b)| a.data_type() == b.data_type());
+    if !matches {
+        return batch;
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(Arc::clone(schema), batch.columns().to_vec(), &options)
+        .unwrap_or(batch)
+}
+
+impl PostgresConnection {
+    /// Prepares `sql`, derives the result schema from the statement metadata and streams
+    /// the rows as Arrow batches of that schema.
+    pub(crate) async fn query_stream<P, I>(
+        &self,
+        sql: &str,
+        params: I,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream>
+    where
+        P: BorrowToSql,
+        I: IntoIterator<Item = P>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        // `query_raw(&str, ..)` prepares an unnamed statement anyway, so preparing here
+        // costs no extra round trip and exposes the result columns up front.
+        let stmt = self.conn.prepare(sql).await.context(QuerySnafu)?;
+        let derived = statement_schema(&stmt).context(ConversionSnafu)?;
+        let schema = overlay_projected(&derived, projected_schema.as_ref());
+        let decode_schema = Some(Arc::clone(&schema));
+
         let streamable = self
             .conn
-            .query_raw(sql, params.iter().copied()) // use .query_raw to get access to the underlying RowStream
+            .query_raw(&stmt, params)
             .await
             .context(QuerySnafu)?;
 
-        // chunk the stream into groups of rows
+        let batch_schema = Arc::clone(&schema);
         let mut stream = streamable.chunks(4_000).boxed().map(move |rows| {
             let rows = rows
                 .into_iter()
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .context(QuerySnafu)?;
-            let rec = rows_to_arrow(rows.as_slice(), &projected_schema).context(ConversionSnafu)?;
-            Ok::<_, PostgresError>(rec)
+            let rec = rows_to_arrow(rows.as_slice(), &decode_schema).context(ConversionSnafu)?;
+            Ok::<_, PostgresError>(conform_batch(rec, &batch_schema))
         });
 
-        let Some(first_chunk) = stream.next().await else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
-        };
-
-        let first_chunk = first_chunk?;
-        let schema = first_chunk.schema(); // pull out the schema from the first chunk to use in the DataFusion Stream Adapter
-
         let output_stream = stream! {
-           yield Ok(first_chunk);
            while let Some(batch) = stream.next().await {
                 match batch {
-                    Ok(batch) => {
-                        yield Ok(batch); // we can yield the batch as-is because we've already converted to Arrow in the chunk map
-                    }
+                    Ok(batch) => yield Ok(batch),
                     Err(e) => {
                         yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}")));
                     }
@@ -508,13 +636,6 @@ impl<'a> AsyncDbConnection<PostgresPooledConnection, &'a (dyn ToSql + Sync)>
             output_stream,
         )))
     }
-
-    async fn execute(&self, sql: &str, params: &[&'a (dyn ToSql + Sync)]) -> Result<u64> {
-        Ok(self.conn.execute(sql, params).await?)
-    }
-}
-
-impl PostgresConnection {
     #[must_use]
     pub fn with_unsupported_type_action(mut self, action: UnsupportedTypeAction) -> Self {
         self.unsupported_type_action = action;

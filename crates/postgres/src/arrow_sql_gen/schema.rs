@@ -8,18 +8,45 @@ use super::hive_schema;
 use crate::conn::PostgresVariant;
 use datafusion_table_providers_common::UnsupportedTypeAction;
 
-/// The Arrow precision and scale used for a Postgres `numeric` that declares none of its own —
-/// a bare `numeric`, and anything derived from one such as `max()`, `avg()` or arithmetic.
+/// The largest precision that fits `Decimal128`.
+pub(crate) const MAX_DECIMAL128_PRECISION: u16 = 38;
+/// The largest precision that fits `Decimal256`.
+pub(crate) const MAX_DECIMAL256_PRECISION: u16 = 76;
+
+/// Maps a Postgres `numeric` to Arrow.
 ///
-/// Such a column has no fixed scale in Postgres: every row may carry a different number of
-/// decimal places. An Arrow column needs a single scale for all of its rows, so one is pinned
-/// here rather than inferred from whichever row happens to arrive first — inferring it made the
-/// result depend on row order and silently rounded every later, longer value.
-///
-/// Both the schema path ([`parse_numeric_type`]) and the row-decode path
-/// (`arrow_sql_gen::rows_to_arrow`) read these, so the two cannot drift apart.
-pub(crate) const DEFAULT_NUMERIC_PRECISION: u8 = 38;
-pub(crate) const DEFAULT_NUMERIC_SCALE: i8 = 20;
+/// `None` is an unconstrained `numeric` (no declared precision, including anything derived
+/// from one such as `max()`, `avg()` or arithmetic). Such a column has no fixed scale, so no
+/// Arrow decimal can hold it exactly; it is carried as the Postgres text rendering in `Utf8`.
+/// Constrained columns use `Decimal128` up to precision 38, `Decimal256` up to 76, and `Utf8`
+/// beyond that.
+#[must_use]
+pub(crate) fn numeric_to_arrow_type(precision_scale: Option<(u16, i8)>) -> DataType {
+    match precision_scale {
+        Some((p, s)) if p <= MAX_DECIMAL128_PRECISION => DataType::Decimal128(p as u8, s),
+        Some((p, s)) if p <= MAX_DECIMAL256_PRECISION => DataType::Decimal256(p as u8, s),
+        _ => DataType::Utf8,
+    }
+}
+
+/// Decodes a Postgres `numeric` type modifier into `(precision, scale)`; `None` when
+/// unconstrained (`-1`).
+#[must_use]
+pub(crate) fn numeric_typmod_precision_scale(typmod: i32) -> Option<(u16, i8)> {
+    if typmod < 4 {
+        return None;
+    }
+    let t = typmod - 4;
+    let precision = u16::try_from((t >> 16) & 0xffff).ok()?;
+    // Postgres 15+ allows negative scales, stored as an 11-bit signed value.
+    let raw_scale = t & 0x7ff;
+    let scale = if raw_scale & 0x400 != 0 {
+        raw_scale - 0x800
+    } else {
+        raw_scale
+    };
+    Some((precision, i8::try_from(scale).ok()?))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParseContext {
@@ -68,8 +95,7 @@ pub(crate) fn pg_data_type_to_arrow_type(
         "bigint" | "int8" | "money" => Ok(DataType::Int64),
         "oid" | "xid" | "regproc" => Ok(DataType::UInt32),
         "numeric" | "decimal" => {
-            let (precision, scale) = parse_numeric_type(pg_type)?;
-            Ok(DataType::Decimal128(precision, scale))
+            Ok(numeric_to_arrow_type(parse_numeric_type(pg_type)?))
         }
         "real" | "float4" => Ok(DataType::Float32),
         "double precision" | "float8" => Ok(DataType::Float64),
@@ -253,15 +279,15 @@ fn parse_composite_type(
     Ok(DataType::Struct(Fields::from(fields?)))
 }
 
-fn parse_numeric_type(pg_type: &str) -> Result<(u8, i8), ArrowError> {
+fn parse_numeric_type(pg_type: &str) -> Result<Option<(u16, i8)>, ArrowError> {
     let type_str = pg_type
         .trim_start_matches("numeric")
         .trim_start_matches("decimal")
         .trim();
 
     if type_str.is_empty() || type_str == "()" {
-        // Default precision and scale if not specified — shared with the row-decode path.
-        return Ok((DEFAULT_NUMERIC_PRECISION, DEFAULT_NUMERIC_SCALE));
+        // Unconstrained `numeric`.
+        return Ok(None);
     }
 
     let parts: Vec<&str> = type_str
@@ -274,20 +300,20 @@ fn parse_numeric_type(pg_type: &str) -> Result<(u8, i8), ArrowError> {
         1 => {
             let precision = parts[0]
                 .trim()
-                .parse::<u8>()
+                .parse::<u16>()
                 .map_err(|_| ArrowError::ParseError("Invalid numeric precision".to_string()))?;
-            Ok((precision, 0))
+            Ok(Some((precision, 0)))
         }
         2 => {
             let precision = parts[0]
                 .trim()
-                .parse::<u8>()
+                .parse::<u16>()
                 .map_err(|_| ArrowError::ParseError("Invalid numeric precision".to_string()))?;
             let scale = parts[1]
                 .trim()
                 .parse::<i8>()
                 .map_err(|_| ArrowError::ParseError("Invalid numeric scale".to_string()))?;
-            Ok((precision, scale))
+            Ok(Some((precision, scale)))
         }
         _ => Err(ArrowError::ParseError(
             "Invalid numeric type format".to_string(),
@@ -387,12 +413,22 @@ mod tests {
         assert_eq!(
             pg_data_type_to_arrow_type("numeric", &context, None)
                 .expect("Failed to convert numeric"),
-            DataType::Decimal128(38, 20)
+            DataType::Utf8
         );
         assert_eq!(
             pg_data_type_to_arrow_type("numeric()", &context, None)
                 .expect("Failed to convert numeric()"),
-            DataType::Decimal128(38, 20)
+            DataType::Utf8
+        );
+        assert_eq!(
+            pg_data_type_to_arrow_type("numeric(60,8)", &context, None)
+                .expect("Failed to convert numeric(60,8)"),
+            DataType::Decimal256(60, 8)
+        );
+        assert_eq!(
+            pg_data_type_to_arrow_type("numeric(77,0)", &context, None)
+                .expect("Failed to convert numeric(77,0)"),
+            DataType::Utf8
         );
         assert_eq!(
             pg_data_type_to_arrow_type("numeric(10,2)", &context, None)
@@ -433,38 +469,50 @@ mod tests {
     }
 
     #[test]
+    fn test_numeric_typmod() {
+        // numeric(10,2) => ((10 << 16) | 2) + 4
+        assert_eq!(numeric_typmod_precision_scale((10 << 16 | 2) + 4), Some((10, 2)));
+        assert_eq!(numeric_typmod_precision_scale(-1), None);
+        // numeric(5,-2) (Postgres 15+)
+        assert_eq!(
+            numeric_typmod_precision_scale((5 << 16 | (0x800 - 2)) + 4),
+            Some((5, -2))
+        );
+    }
+
+    #[test]
     fn test_parse_numeric_type() {
         assert_eq!(
             parse_numeric_type("numeric").expect("Failed to parse numeric"),
-            (38, 20)
+            None
         );
         assert_eq!(
             parse_numeric_type("numeric()").expect("Failed to parse numeric()"),
-            (38, 20)
+            None
         );
         assert_eq!(
             parse_numeric_type("numeric(10)").expect("Failed to parse numeric(10)"),
-            (10, 0)
+            Some((10, 0))
         );
         assert_eq!(
             parse_numeric_type("numeric(10,2)").expect("Failed to parse numeric(10,2)"),
-            (10, 2)
+            Some((10, 2))
         );
         assert_eq!(
             parse_numeric_type("decimal").expect("Failed to parse decimal"),
-            (38, 20)
+            None
         );
         assert_eq!(
             parse_numeric_type("decimal()").expect("Failed to parse decimal()"),
-            (38, 20)
+            None
         );
         assert_eq!(
             parse_numeric_type("decimal(15)").expect("Failed to parse decimal(15)"),
-            (15, 0)
+            Some((15, 0))
         );
         assert_eq!(
             parse_numeric_type("decimal(15,5)").expect("Failed to parse decimal(15,5)"),
-            (15, 5)
+            Some((15, 5))
         );
 
         // Test invalid formats
@@ -835,11 +883,8 @@ mod tests {
             redshift("decimal(38,0)").expect("decimal(38,0)"),
             DataType::Decimal128(38, 0)
         );
-        // Bare `decimal` falls back to the default precision/scale.
-        assert_eq!(
-            redshift("decimal").expect("decimal"),
-            DataType::Decimal128(38, 20)
-        );
+        // Bare `decimal` is unconstrained and carried as text.
+        assert_eq!(redshift("decimal").expect("decimal"), DataType::Utf8);
     }
 
     #[test]
