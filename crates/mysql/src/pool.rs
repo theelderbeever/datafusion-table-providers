@@ -1,4 +1,5 @@
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::indexes::{IndexDiscovery, IndexInfo};
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
 use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use crate::conn::MySQLConnection;
@@ -520,5 +521,48 @@ mod tls_tests {
         .unwrap()
         .is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Lists the indexes of a table from `information_schema.statistics`. The schema defaults to
+/// the connection's current database. Functional key parts (which have no column name) are
+/// listed as empty strings.
+#[async_trait]
+impl IndexDiscovery for MySQLConnectionPool {
+    async fn indexes(
+        &self,
+        table: &TableReference,
+    ) -> std::result::Result<Vec<IndexInfo>, GenericError> {
+        let mut conn = self.pool.get_conn().await?;
+        let rows: Vec<Row> = conn
+            .exec(
+                "SELECT INDEX_NAME, NON_UNIQUE, INDEX_TYPE, COLUMN_NAME \
+                 FROM information_schema.statistics \
+                 WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+                 ORDER BY INDEX_NAME = 'PRIMARY' DESC, INDEX_NAME, SEQ_IN_INDEX",
+                (table.schema(), table.table()),
+            )
+            .await?;
+
+        let mut indexes: Vec<IndexInfo> = Vec::new();
+        for row in rows {
+            let name: String = row.get(0).unwrap_or_default();
+            let non_unique: i64 = row.get(1).unwrap_or(1);
+            let kind: Option<String> = row.get(2);
+            let column: Option<String> = row.get::<Option<String>, _>(3).flatten();
+            let column = column.unwrap_or_default();
+            match indexes.last_mut() {
+                Some(index) if index.name == name => index.columns.push(column),
+                _ => indexes.push(IndexInfo {
+                    primary: name == "PRIMARY",
+                    unique: non_unique == 0,
+                    columns: vec![column],
+                    kind,
+                    definition: None,
+                    name,
+                }),
+            }
+        }
+        Ok(indexes)
     }
 }
