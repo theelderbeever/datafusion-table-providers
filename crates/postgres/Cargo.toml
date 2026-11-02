@@ -45,6 +45,7 @@ federation = ["dep:datafusion-federation", "datafusion-table-providers-common/fe
 
 [dev-dependencies]
 geozero = { version = "0.15.1", features = ["with-wkb"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
 all-features = true
