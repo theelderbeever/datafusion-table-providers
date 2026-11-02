@@ -16,7 +16,7 @@ datafusion-federation = { workspace = true, features = ["sql"], optional = true 
 datafusion-table-providers-common = { workspace = true }
 fundu = "2.0"
 futures = { workspace = true }
-rusqlite = { version = "0.37" }
+rusqlite = { version = "0.37", features = ["column_decltype"] }
 sea-query = { workspace = true, features = ["backend-sqlite", "with-rust_decimal", "with-bigdecimal", "with-time", "with-chrono"] }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["macros", "fs"] }

@@ -26,8 +26,9 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
 use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
+use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
 use rusqlite::{
-    types::{Type, ValueRef},
+    types::{Type, Value, ValueRef},
     Row, Rows,
 };
 use snafu::prelude::*;
@@ -59,17 +60,217 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Converts Sqlite `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
-/// sets the schema based on the first row.
+/// Maps a declared column type to an Arrow type using SQLite's affinity rules
+/// (<https://www.sqlite.org/datatype3.html#determination_of_column_affinity>).
+///
+/// Returns `None` for columns whose values can't be typed from the declaration alone: no
+/// declared type (expressions) and `NUMERIC` affinity (e.g. `DECIMAL`, `BOOLEAN`, `DATE`).
+#[must_use]
+pub fn decl_type_to_data_type(decl_type: &str) -> Option<DataType> {
+    let upper = decl_type.to_ascii_uppercase();
+    if upper.contains("INT") {
+        Some(DataType::Int64)
+    } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+        Some(DataType::Utf8)
+    } else if upper.contains("BLOB") {
+        Some(DataType::Binary)
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+/// Widens an inferred column type to also hold a value of `storage` class.
+fn widen(current: &DataType, storage: Type) -> DataType {
+    match (current, storage) {
+        (_, Type::Null) => current.clone(),
+        (DataType::Null, other) => map_column_type_to_data_type(other),
+        (DataType::Int64, Type::Integer) => DataType::Int64,
+        (DataType::Int64 | DataType::Float64, Type::Integer | Type::Real) => DataType::Float64,
+        (DataType::Binary, _) | (_, Type::Blob) => DataType::Binary,
+        _ => DataType::Utf8,
+    }
+}
+
+/// Converts Sqlite `Rows` to an Arrow `RecordBatch`.
+///
+/// With a projected schema, columns decode to that schema's types. Otherwise each column's
+/// type comes from its declared type (via [`decl_type_to_data_type`]) and is widened by the
+/// storage classes of the values actually returned, so a NULL or mixed first row doesn't
+/// pick the wrong type. A column with no declared type and only NULL values is `Null`.
+/// Fields carry [`SOURCE_TYPE_METADATA_KEY`] when the column has a declared type.
 ///
 /// # Errors
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 pub fn rows_to_arrow(
-    mut rows: Rows,
+    rows: Rows,
     num_cols: usize,
     projected_schema: Option<SchemaRef>,
 ) -> Result<RecordBatch> {
+    match projected_schema {
+        Some(schema) => rows_to_arrow_projected(rows, num_cols, schema),
+        None => rows_to_arrow_inferred(rows, num_cols),
+    }
+}
+
+fn column_metadata(rows: &Rows, num_cols: usize) -> Result<Vec<(String, Option<String>)>> {
+    let Some(stmt) = rows.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let columns = stmt.columns();
+    (0..num_cols)
+        .map(|i| {
+            let name = stmt
+                .column_name(i)
+                .context(FailedToExtractColumnNameSnafu)?
+                .to_string();
+            let decl = columns
+                .get(i)
+                .and_then(|c| c.decl_type())
+                .map(str::to_string);
+            Ok((name, decl))
+        })
+        .collect()
+}
+
+fn inferred_field(name: &str, decl: Option<&String>, data_type: DataType) -> Field {
+    let field = Field::new(name, data_type, true);
+    match decl {
+        Some(decl) => field.with_metadata(std::collections::HashMap::from([(
+            SOURCE_TYPE_METADATA_KEY.to_string(),
+            decl.clone(),
+        )])),
+        None => field,
+    }
+}
+
+fn rows_to_arrow_inferred(mut rows: Rows, num_cols: usize) -> Result<RecordBatch> {
+    let metadata = column_metadata(&rows, num_cols)?;
+    let mut types: Vec<DataType> = metadata
+        .iter()
+        .map(|(_, decl)| {
+            decl.as_deref()
+                .and_then(decl_type_to_data_type)
+                .unwrap_or(DataType::Null)
+        })
+        .collect();
+
+    let mut values: Vec<Vec<Value>> = Vec::new();
+    while let Some(row) = rows.next().context(FailedToExtractRowValueSnafu)? {
+        let mut row_values = Vec::with_capacity(num_cols);
+        for (i, ty) in types.iter_mut().enumerate() {
+            let value: Value = row
+                .get_ref(i)
+                .context(FailedToExtractRowValueSnafu)?
+                .into();
+            *ty = widen(ty, value.data_type());
+            row_values.push(value);
+        }
+        values.push(row_values);
+    }
+
+    let mut builders: Vec<Box<dyn ArrayBuilder>> =
+        types.iter().map(map_data_type_to_array_builder).collect();
+    for row in &values {
+        for (i, value) in row.iter().enumerate() {
+            append_owned_value(builders[i].as_mut(), &types[i], value, i)?;
+        }
+    }
+
+    let fields: Vec<Field> = metadata
+        .iter()
+        .zip(&types)
+        .map(|((name, decl), ty)| inferred_field(name, decl.as_ref(), ty.clone()))
+        .collect();
+    let columns = builders
+        .into_iter()
+        .map(|mut b| b.finish())
+        .collect::<Vec<ArrayRef>>();
+    let options = &RecordBatchOptions::new().with_row_count(Some(values.len()));
+    RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), columns, options)
+        .context(FailedToBuildRecordBatchSnafu)
+}
+
+/// Appends an owned value to a builder of an inferred type (one of `Null`, `Int64`,
+/// `Float64`, `Utf8`, `Binary`). [`widen`] guarantees the value fits.
+fn append_owned_value(
+    builder: &mut dyn ArrayBuilder,
+    data_type: &DataType,
+    value: &Value,
+    index: usize,
+) -> Result<()> {
+    let downcast_err = || Error::FailedToDowncastBuilder {
+        sqlite_type: format!("{data_type}"),
+    };
+    match data_type {
+        DataType::Null => builder
+            .as_any_mut()
+            .downcast_mut::<NullBuilder>()
+            .ok_or_else(downcast_err)?
+            .append_null(),
+        DataType::Int64 => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Int64Builder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Value::Integer(v) => b.append_value(*v),
+                Value::Real(v) => b.append_value(integral_real_to_i64(index, *v)?),
+                _ => b.append_null(),
+            }
+        }
+        DataType::Float64 => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<Float64Builder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                #[allow(clippy::cast_precision_loss)]
+                Value::Integer(v) => b.append_value(*v as f64),
+                Value::Real(v) => b.append_value(*v),
+                _ => b.append_null(),
+            }
+        }
+        DataType::Utf8 => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Value::Null => b.append_null(),
+                Value::Integer(v) => b.append_value(v.to_string()),
+                Value::Real(v) => b.append_value(v.to_string()),
+                Value::Text(v) => b.append_value(v),
+                Value::Blob(v) => b.append_value(String::from_utf8_lossy(v)),
+            }
+        }
+        _ => {
+            let b = builder
+                .as_any_mut()
+                .downcast_mut::<BinaryBuilder>()
+                .ok_or_else(downcast_err)?;
+            match value {
+                Value::Null => b.append_null(),
+                Value::Integer(v) => b.append_value(v.to_string()),
+                Value::Real(v) => b.append_value(v.to_string()),
+                Value::Text(v) => b.append_value(v),
+                Value::Blob(v) => b.append_value(v),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes rows into the types of `projected_schema`.
+fn rows_to_arrow_projected(
+    mut rows: Rows,
+    num_cols: usize,
+    projected_schema: SchemaRef,
+) -> Result<RecordBatch> {
+    let projected_schema = Some(projected_schema);
+    let metadata = column_metadata(&rows, num_cols)?;
     let mut arrow_fields: Vec<Field> = Vec::new();
     let mut arrow_columns_builders: Vec<Box<dyn ArrayBuilder>> = Vec::new();
     let mut arrow_types: Vec<DataType> = Vec::new();
@@ -134,6 +335,21 @@ pub fn rows_to_arrow(
     while let Ok(Some(row)) = rows.next() {
         add_row_to_builders(row, &arrow_types, &mut arrow_columns_builders)?;
         row_count += 1;
+    }
+
+    // No rows: take the column types from the projected schema.
+    if arrow_fields.is_empty() {
+        if let Some(schema) = projected_schema.as_ref() {
+            for (i, (name, _)) in metadata.iter().enumerate() {
+                let data_type = schema
+                    .fields()
+                    .get(i)
+                    .map(|f| to_sqlite_decoding_type(f.data_type(), &Type::Integer))
+                    .unwrap_or(DataType::Null);
+                arrow_columns_builders.push(map_data_type_to_array_builder(&data_type));
+                arrow_fields.push(Field::new(name, data_type, true));
+            }
+        }
     }
 
     let columns = arrow_columns_builders
@@ -320,6 +536,67 @@ mod tests {
 
     fn int64_schema(name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]))
+    }
+
+    fn exec_to_arrow(setup: &str, sql: &str) -> RecordBatch {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite connection");
+        conn.execute_batch(setup).expect("setup");
+        let mut stmt = conn.prepare(sql).expect("prepare statement");
+        let num_cols = stmt.column_count();
+        let rows = stmt.query([]).expect("execute query");
+        rows_to_arrow(rows, num_cols, None).expect("convert")
+    }
+
+    #[test]
+    fn declared_integer_with_null_first_row_is_int64() {
+        let batch = exec_to_arrow(
+            "CREATE TABLE t (id INTEGER, name TEXT); INSERT INTO t VALUES (NULL, NULL), (2, 'b');",
+            "SELECT id, name FROM t",
+        );
+        assert_eq!(batch.schema().field(0).data_type(), &DataType::Int64);
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            batch.schema().field(0).metadata().get(SOURCE_TYPE_METADATA_KEY),
+            Some(&"INTEGER".to_string())
+        );
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 array");
+        assert!(col.is_null(0));
+        assert_eq!(col.value(1), 2);
+    }
+
+    #[test]
+    fn empty_result_keeps_declared_schema() {
+        let batch = exec_to_arrow(
+            "CREATE TABLE t (id INTEGER, v REAL, b BLOB);",
+            "SELECT id, v, b FROM t WHERE false",
+        );
+        assert_eq!(batch.num_rows(), 0);
+        let types: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(types, vec![DataType::Int64, DataType::Float64, DataType::Binary]);
+    }
+
+    #[test]
+    fn expression_columns_scan_past_nulls() {
+        let batch = exec_to_arrow(
+            "",
+            "SELECT v, w, n FROM (SELECT NULL AS v, 1 AS w, NULL AS n UNION ALL SELECT 3, 2.5, NULL)",
+        );
+        let types: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.data_type().clone())
+            .collect();
+        assert_eq!(types, vec![DataType::Int64, DataType::Float64, DataType::Null]);
     }
 
     #[test]

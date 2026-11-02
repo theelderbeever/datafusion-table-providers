@@ -192,6 +192,14 @@ impl SqliteConnectionPool {
         })
     }
 
+    /// The database files configured to be attached (via
+    /// [`SqliteConnectionPoolFactory::with_databases`]). They are attached as
+    /// `attachment_{index}` in this order.
+    #[must_use]
+    pub fn attached_databases(&self) -> &[Arc<str>] {
+        &self.attach_databases
+    }
+
     /// Initializes an SQLite database on-disk without creating a connection pool.
     /// No-op if the database is in-memory.
     pub async fn init(path: &str, mode: Mode) -> PoolResult<()> {
@@ -471,6 +479,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sqlite_attached_database_listed_in_schemas() {
+        let dir = std::env::temp_dir().join(format!("dtp_sqlite_attach_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_db = dir.join("main.sqlite").to_string_lossy().to_string();
+        let other_db = dir.join("other.sqlite").to_string_lossy().to_string();
+        {
+            let c = rusqlite::Connection::open(&other_db).unwrap();
+            c.execute_batch("CREATE TABLE IF NOT EXISTS other_t (x INTEGER)")
+                .unwrap();
+        }
+        let factory =
+            SqliteConnectionPoolFactory::new(&main_db, Mode::File, Duration::from_millis(5000))
+                .with_databases(Some(vec![other_db.clone().into()]));
+        let pool = factory.build().await.unwrap();
+        assert!(pool.attached_databases().iter().any(|d| d.as_ref() == other_db));
+        let conn = pool.connect().await.unwrap();
+        let conn = conn.as_async().unwrap();
+        let schemas = conn.schemas().await.unwrap();
+        assert!(schemas.contains(&"main".to_string()), "{schemas:?}");
+        let attached = schemas
+            .iter()
+            .find(|s| s.starts_with("attachment_"))
+            .unwrap_or_else(|| panic!("no attachment in {schemas:?}"));
+        let tables = conn.tables(attached).await.unwrap();
+        assert!(tables.contains(&"other_t".to_string()), "{tables:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn test_sqlite_connection_pool_factory_with_schema() {
         let factory = SqliteConnectionPoolFactory::new(
             "./test.sqlite",
@@ -500,7 +537,8 @@ mod tests {
         assert!(field1.is_nullable());
         let field2 = inferred.field(1);
         assert_eq!(field2.name(), "name");
-        assert_eq!(field2.data_type(), &DataType::Null); // inferring uses only the first row
+        // typed from the declared column type, not the first row's NULL value
+        assert_eq!(field2.data_type(), &DataType::Utf8);
         assert!(field2.is_nullable());
 
         // the provided schemas are used as-is, each one for its own table

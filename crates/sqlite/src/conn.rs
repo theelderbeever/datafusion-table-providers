@@ -100,17 +100,19 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
 
     async fn tables(
         &self,
-        _schema: &str,
+        schema: &str,
     ) -> Result<
         Vec<String>,
         datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
     > {
+        let schema = if schema.is_empty() { "main" } else { schema };
+        let master = format!("\"{}\".sqlite_master", schema.replace('"', "\"\""));
         let tables = self
             .conn
             .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-                )?;
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT name FROM {master} WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ))?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 let tables: Result<Vec<_>, rusqlite::Error> = rows.collect();
                 tables
@@ -128,7 +130,19 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         Vec<String>,
         datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Error,
     > {
-        Ok(vec!["main".to_string()])
+        // `main` plus attached databases; `temp` is excluded.
+        let schemas = self
+            .conn
+            .call(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT name FROM pragma_database_list WHERE name <> 'temp' ORDER BY seq")?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, rusqlite::Error>>()
+            })
+            .await
+            .boxed()
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemasSnafu)?;
+        Ok(schemas)
     }
 
     async fn get_schema(
