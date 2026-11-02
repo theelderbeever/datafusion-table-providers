@@ -4,6 +4,8 @@ use secrecy::SecretString;
 use std::sync::Arc;
 
 pub mod dbconnection;
+pub mod indexes;
+pub mod query;
 
 pub mod runtime;
 

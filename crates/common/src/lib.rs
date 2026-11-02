@@ -19,6 +19,15 @@ pub const DESCRIPTION_METADATA_KEY: &str = "description";
 /// pushdown).
 pub const SOURCE_TYPE_METADATA_KEY: &str = "source_type";
 
+/// Arrow field metadata key describing how a column's values are encoded when the
+/// Arrow type is not a faithful representation of the source type. `"text"` means the
+/// values are the source database's text rendering (e.g. unconstrained Postgres
+/// `numeric` mapped to `Utf8`).
+pub const SOURCE_ENCODING_METADATA_KEY: &str = "source_encoding";
+
+/// [`SOURCE_ENCODING_METADATA_KEY`] value for columns holding the source's text rendering.
+pub const SOURCE_ENCODING_TEXT: &str = "text";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("The database file path is not within the current directory: {path}"))]

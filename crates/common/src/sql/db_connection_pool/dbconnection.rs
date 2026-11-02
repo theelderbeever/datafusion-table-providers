@@ -5,7 +5,10 @@ use datafusion::{
 };
 use snafu::prelude::*;
 
-use crate::sql::db_connection_pool::runtime::run_async_with_tokio;
+use crate::sql::db_connection_pool::{
+    query::{reject_settings, ParamError, QueryOptions, QueryParams},
+    runtime::run_async_with_tokio,
+};
 
 pub type GenericError = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T, E = GenericError> = std::result::Result<T, E>;
@@ -98,6 +101,28 @@ pub trait SyncDbConnection<T, P>: DbConnection<T, P> {
     ///
     /// Returns an error if the execution fails.
     fn execute(&self, sql: &str, params: &[P]) -> Result<u64>;
+
+    /// Query with provider-neutral bind parameters and options.
+    ///
+    /// The default implementation supports no parameters and no settings; `query_id` and
+    /// extensions are ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or the parameters/options are unsupported.
+    fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        if !params.is_empty() {
+            return Err(ParamError::ParamsUnsupported {}.into());
+        }
+        reject_settings(options)?;
+        self.query_arrow(sql, &[], projected_schema)
+    }
 }
 
 #[async_trait::async_trait]
@@ -151,6 +176,24 @@ pub trait AsyncDbConnection<T, P>: DbConnection<T, P> + Sync {
     /// * `sql` - The SQL statement.
     /// * `params` - The parameters for the SQL statement.
     async fn execute(&self, sql: &str, params: &[P]) -> Result<u64>;
+
+    /// Query with provider-neutral bind parameters and options.
+    ///
+    /// The default implementation supports no parameters and no settings; `query_id` and
+    /// extensions are ignored.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        if !params.is_empty() {
+            return Err(ParamError::ParamsUnsupported {}.into());
+        }
+        reject_settings(options)?;
+        self.query_arrow(sql, &[], projected_schema).await
+    }
 }
 
 pub trait DbConnection<T, P>: Send {
@@ -273,6 +316,30 @@ pub async fn query_arrow<T, P>(
             .context(UnableToQueryArrowSnafu {})
     } else if let Some(conn) = conn.as_async() {
         conn.query_arrow(&sql, &[], projected_schema)
+            .await
+            .context(UnableToQueryArrowSnafu {})
+    } else {
+        Err(Error::UnableToDowncastConnection {})
+    }
+}
+
+/// Query the database with provider-neutral bind parameters and options.
+///
+/// # Errors
+///
+/// Returns an error if the query fails or the parameters/options are unsupported.
+pub async fn query_arrow_with_params<T, P>(
+    conn: Box<dyn DbConnection<T, P>>,
+    sql: String,
+    params: &QueryParams,
+    options: &QueryOptions,
+    projected_schema: Option<SchemaRef>,
+) -> Result<SendableRecordBatchStream, Error> {
+    if let Some(conn) = conn.as_sync() {
+        conn.query_arrow_with_params(&sql, params, options, projected_schema)
+            .context(UnableToQueryArrowSnafu {})
+    } else if let Some(conn) = conn.as_async() {
+        conn.query_arrow_with_params(&sql, params, options, projected_schema)
             .await
             .context(UnableToQueryArrowSnafu {})
     } else {
