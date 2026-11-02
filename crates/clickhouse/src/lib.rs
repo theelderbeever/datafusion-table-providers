@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 pub mod conn;
+pub mod params;
 pub mod pool;
 
 use clickhouse::Client;

@@ -5,6 +5,8 @@ use arrow::array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
 use async_trait::async_trait;
 use clickhouse::{query::Query, Client, Row};
+use crate::params::apply_params_and_options;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{QueryOptions, QueryParams};
 use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -234,6 +236,21 @@ impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
     > {
         self.query_stream(self.client.query(sql), projected_schema)
             .await
+    }
+
+    /// Binds positional (`?`, client-side) and named (`{name:Type}`, server-side)
+    /// parameters, and sends `query_id` and `settings` as ClickHouse settings.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
+        SendableRecordBatchStream,
+    > {
+        let query = apply_params_and_options(self.client.query(sql), params, options)?;
+        self.query_stream(query, projected_schema).await
     }
 
     /// Execute the given SQL statement with parameters, returning the number of affected rows.

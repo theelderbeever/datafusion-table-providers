@@ -1,3 +1,6 @@
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use std::{collections::HashMap, sync::Arc};
 
 use clickhouse::{Client, Compression};
@@ -116,6 +119,28 @@ impl ClickHouseConnectionPool {
         })
     }
 
+    /// Creates a pool from a preconfigured client, e.g. one with a custom TLS setup, client
+    /// identity, or settings such as `output_format_arrow_string_as_string = 0`.
+    ///
+    /// `compute_context` identifies the server for join pushdown: tables of pools with the
+    /// same context may be joined in a single query. No connectivity check is made.
+    #[must_use]
+    pub fn from_client(client: Client, compute_context: impl Into<String>) -> Self {
+        Self {
+            client,
+            join_push_down: JoinPushDown::AllowedFor(compute_context.into()),
+            schemas: Arc::default(),
+        }
+    }
+
+    /// Use the provided `schemas` instead of inferring them from the database, replacing any
+    /// set before. See [`Self::with_schema`].
+    #[must_use]
+    pub fn with_schemas(mut self, schemas: Arc<TableSchemas>) -> Self {
+        self.schemas = schemas;
+        self
+    }
+
     /// Use the provided `schema` for `table_reference` instead of inferring it from the database.
     ///
     /// Call it once per table to provide the schemas of several tables. Table references are
@@ -153,5 +178,19 @@ impl DbConnectionPool<Client, ()> for ClickHouseConnectionPool {
 
     fn join_push_down(&self) -> JoinPushDown {
         self.join_push_down.clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl NativeQueryExecutor for ClickHouseConnectionPool {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> std::result::Result<SendableRecordBatchStream, GenericError> {
+        self.connect_direct()?
+            .query_arrow_with_params(sql, params, options, None)
+            .await
     }
 }

@@ -2518,6 +2518,7 @@ dependencies = [
  "arrow-ipc",
  "async-stream",
  "async-trait",
+ "chrono",
  "clickhouse",
  "datafusion",
  "datafusion-federation",

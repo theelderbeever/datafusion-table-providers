@@ -19,6 +19,7 @@ datafusion-table-providers-common = { workspace = true }
 futures = { workspace = true }
 regex = "1"
 serde = { workspace = true }
+chrono = { workspace = true }
 snafu = { workspace = true }
 secrecy = { workspace = true }
 url = { workspace = true }
