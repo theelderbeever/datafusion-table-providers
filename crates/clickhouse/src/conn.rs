@@ -1,11 +1,12 @@
 use std::io::Cursor;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
 use async_trait::async_trait;
-use clickhouse::{Client, Row};
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use clickhouse::{query::Query, Client, Row};
+use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::EmptyRecordBatchStream;
 use datafusion::{common::TableReference, execution::SendableRecordBatchStream};
@@ -171,7 +172,7 @@ impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
                 replace_clickhouse_ddl_parameters(&view_query)
             )
         } else {
-            let table_ref = TableReference::partial(database, table_reference.table());
+            let table_ref = TableReference::partial(database.clone(), table_reference.table());
             format!("SELECT * FROM {} LIMIT 0", table_ref.to_quoted_string())
         };
 
@@ -189,7 +190,27 @@ impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
             .and_then(|bytes| StreamReader::try_new(Cursor::new(bytes), None).boxed())
             .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
 
-        return Ok(reader.schema());
+        #[derive(Row, Deserialize)]
+        struct ColumnTypeRow {
+            name: String,
+            #[serde(rename = "type")]
+            type_: String,
+        }
+        let column_types: Vec<ColumnTypeRow> = self
+            .client
+            .query("SELECT name, type FROM system.columns WHERE database = ? AND table = ?")
+            .bind(&database)
+            .bind(table_reference.table())
+            .fetch_all()
+            .await
+            .boxed()
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToGetSchemaSnafu)?;
+        let column_types: HashMap<String, String> = column_types
+            .into_iter()
+            .map(|c| (c.name, c.type_))
+            .collect();
+
+        Ok(with_source_types(&reader.schema(), &column_types))
     }
 
     /// Query the database with the given SQL statement and parameters, returning a `Result` of `SendableRecordBatchStream`.
@@ -211,8 +232,66 @@ impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
     ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
         SendableRecordBatchStream,
     > {
-        let query = self.client.query(sql);
+        self.query_stream(self.client.query(sql), projected_schema)
+            .await
+    }
 
+    /// Execute the given SQL statement with parameters, returning the number of affected rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - The SQL statement.
+    /// * `params` - The parameters for the SQL statement.
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[()],
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<u64> {
+        let mut query = self.client.query(sql);
+
+        for param in params {
+            query = query.bind(param);
+        }
+
+        query
+            .execute()
+            .await
+            .boxed()
+            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToQueryArrowSnafu)?;
+
+        Ok(0)
+    }
+}
+
+/// Attaches [`SOURCE_TYPE_METADATA_KEY`] (from `system.columns.type`) to matching fields.
+fn with_source_types(schema: &SchemaRef, column_types: &HashMap<String, String>) -> SchemaRef {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match column_types.get(f.name()) {
+            Some(source_type) => {
+                let mut metadata = f.metadata().clone();
+                metadata.insert(SOURCE_TYPE_METADATA_KEY.to_string(), source_type.clone());
+                f.as_ref().clone().with_metadata(metadata)
+            }
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+impl ClickHouseConnection {
+    /// Runs `query` with the `ArrowStream` format and streams the decoded batches.
+    ///
+    /// The stream schema is the ArrowStream schema message, so results with zero rows still
+    /// carry their columns.
+    pub(crate) async fn query_stream(
+        &self,
+        query: Query,
+        projected_schema: Option<SchemaRef>,
+    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<
+        SendableRecordBatchStream,
+    > {
         let mut bytes_stream = query
             .fetch_bytes("ArrowStream")
             .boxed()
@@ -243,45 +322,18 @@ impl AsyncDbConnection<Client, ()> for ClickHouseConnection {
                     }
                 }
             };
-            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-        } else if let Some(schema) = projected_schema {
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                EmptyRecordBatchStream::new(schema),
-            )))
-        } else {
-            let schema: Arc<Schema> = Schema::empty().into();
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                EmptyRecordBatchStream::new(schema),
-            )))
-        }
-    }
-
-    /// Execute the given SQL statement with parameters, returning the number of affected rows.
-    ///
-    /// # Arguments
-    ///
-    /// * `sql` - The SQL statement.
-    /// * `params` - The parameters for the SQL statement.
-    async fn execute(
-        &self,
-        sql: &str,
-        params: &[()],
-    ) -> datafusion_table_providers_common::sql::db_connection_pool::dbconnection::Result<u64> {
-        let mut query = self.client.query(sql);
-
-        for param in params {
-            query = query.bind(param);
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)));
         }
 
-        query
-            .execute()
-            .await
-            .boxed()
-            .context(datafusion_table_providers_common::sql::db_connection_pool::dbconnection::UnableToQueryArrowSnafu)?;
-
-        Ok(0)
+        // No batches: the schema message has still been decoded.
+        let schema = decoder
+            .schema()
+            .or(projected_schema)
+            .unwrap_or_else(|| Arc::new(Schema::empty()));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            EmptyRecordBatchStream::new(schema),
+        )))
     }
 }
 
