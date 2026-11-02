@@ -15,6 +15,10 @@ use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::{
 
 use crate::filter::{KeyColumn, PrimaryKey};
 use crate::types::{column_specs_to_schema, rows_to_record_batch};
+use crate::params::{check_params, history_listener, scalar_to_cql};
+use datafusion_table_providers_common::sql::db_connection_pool::query::{QueryOptions, QueryParams};
+use scylla::client::pager::QueryPager;
+use scylla::statement::unprepared::Statement;
 
 /// Number of rows converted to Arrow at a time; Cassandra pages are 5000 rows by default.
 const BATCH_SIZE: usize = 8192;
@@ -24,6 +28,11 @@ pub enum Error {
     #[snafu(display("Failed to query Cassandra: {source}"))]
     Query {
         source: scylla::errors::PagerExecutionError,
+    },
+
+    #[snafu(display("Failed to prepare the Cassandra statement: {source}"))]
+    Prepare {
+        source: scylla::errors::PrepareError,
     },
 
     #[snafu(display("Failed to execute the Cassandra statement: {source}"))]
@@ -216,7 +225,74 @@ impl AsyncDbConnection<Arc<Session>, CqlValue> for CassandraConnection {
             .query_iter(sql, params.to_vec())
             .await
             .context(QuerySnafu)?;
+        self.pager_to_stream(pager, projected_schema)
+    }
 
+    /// Binds positional parameters, coerced to the bind markers' types (the statement is
+    /// prepared when there are parameters). A
+    /// [`CassandraHistoryListener`](crate::params::CassandraHistoryListener) in the option
+    /// extensions is attached to the statement. Named parameters and settings are rejected;
+    /// `query_id` is ignored.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        check_params(params, options)?;
+        let listener = history_listener(options);
+
+        let pager = if params.positional.is_empty() {
+            let mut statement = Statement::new(sql);
+            if let Some(listener) = listener {
+                statement.set_history_listener(listener);
+            }
+            self.session
+                .query_iter(statement, ())
+                .await
+                .context(QuerySnafu)?
+        } else {
+            let mut prepared = self.session.prepare(sql).await.context(PrepareSnafu)?;
+            let specs = prepared.get_variable_col_specs();
+            let values = params
+                .positional
+                .iter()
+                .enumerate()
+                .map(|(i, v)| scalar_to_cql(v, specs.get_by_index(i).map(|s| s.typ())))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if let Some(listener) = listener {
+                prepared.set_history_listener(listener);
+            }
+            self.session
+                .execute_iter(prepared, values)
+                .await
+                .context(QuerySnafu)?
+        };
+        self.pager_to_stream(pager, projected_schema)
+    }
+
+    /// Executes a CQL statement.
+    ///
+    /// Cassandra doesn't report the number of affected rows, so this always returns 0.
+    async fn execute(&self, sql: &str, params: &[CqlValue]) -> Result<u64> {
+        self.session
+            .query_unpaged(sql, params.to_vec())
+            .await
+            .context(ExecuteSnafu)?;
+        Ok(0)
+    }
+}
+
+impl CassandraConnection {
+    /// Streams a pager's rows as Arrow batches. The batches have `projected_schema` when it
+    /// is given, otherwise the schema of the result set; projected fields are matched to the
+    /// result set columns by name.
+    fn pager_to_stream(
+        &self,
+        pager: QueryPager,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
         let column_names: Vec<String> = pager
             .column_specs()
             .iter()
@@ -241,17 +317,6 @@ impl AsyncDbConnection<Arc<Session>, CqlValue> for CassandraConnection {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
-    }
-
-    /// Executes a CQL statement.
-    ///
-    /// Cassandra doesn't report the number of affected rows, so this always returns 0.
-    async fn execute(&self, sql: &str, params: &[CqlValue]) -> Result<u64> {
-        self.session
-            .query_unpaged(sql, params.to_vec())
-            .await
-            .context(ExecuteSnafu)?;
-        Ok(0)
     }
 }
 

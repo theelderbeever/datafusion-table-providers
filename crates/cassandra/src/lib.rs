@@ -13,6 +13,7 @@ pub mod conn;
 #[cfg(feature = "federation")]
 mod federation;
 pub mod filter;
+pub mod params;
 pub mod pool;
 mod table;
 pub mod types;

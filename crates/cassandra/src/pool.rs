@@ -1,3 +1,6 @@
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -329,5 +332,20 @@ mod tests {
         assert_eq!(with_default_port("::1", 9042), "[::1]:9042");
         assert_eq!(with_default_port("[::1]", 9042), "[::1]:9042");
         assert_eq!(with_default_port("[::1]:9043", 9042), "[::1]:9043");
+    }
+}
+
+#[async_trait]
+impl NativeQueryExecutor for CassandraConnectionPool {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> std::result::Result<SendableRecordBatchStream, GenericError> {
+        use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+        self.connect_direct()
+            .query_arrow_with_params(sql, params, options, None)
+            .await
     }
 }
