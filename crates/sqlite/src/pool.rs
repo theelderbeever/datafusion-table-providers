@@ -1,3 +1,4 @@
+use datafusion_table_providers_common::sql::db_connection_pool::indexes::{IndexDiscovery, IndexInfo};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
 use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
@@ -359,6 +360,89 @@ impl NativeQueryExecutor for SqliteConnectionPool {
     }
 }
 
+/// Lists the indexes of a table from `pragma_index_list`/`pragma_index_xinfo`. The schema
+/// defaults to `main`. An `INTEGER PRIMARY KEY` (a rowid alias, which has no index of its
+/// own) is reported as a primary index named `PRIMARY`. Expression key parts are listed as
+/// empty strings.
+#[async_trait]
+impl IndexDiscovery for SqliteConnectionPool {
+    async fn indexes(
+        &self,
+        table: &TableReference,
+    ) -> std::result::Result<Vec<IndexInfo>, GenericError> {
+        let schema = table.schema().unwrap_or("main").to_string();
+        let table_name = table.table().to_string();
+        let indexes = self
+            .conn
+            .call(move |conn| {
+                let master = format!("\"{}\".sqlite_schema", schema.replace('"', "\"\""));
+                let mut list = conn.prepare(&format!(
+                    "SELECT l.name, l.\"unique\", l.origin, m.sql \
+                     FROM pragma_index_list(?1, ?2) AS l \
+                     LEFT JOIN (SELECT name, sql FROM {master}) AS m ON m.name = l.name \
+                     ORDER BY l.origin = 'pk' DESC, l.name"
+                ))?;
+                let entries = list
+                    .query_map(rusqlite::params![table_name, schema], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                let mut xinfo = conn.prepare(
+                    "SELECT name FROM pragma_index_xinfo(?1, ?2) WHERE key = 1 ORDER BY seqno",
+                )?;
+                let mut indexes = Vec::with_capacity(entries.len());
+                for (name, unique, origin, sql) in entries {
+                    let columns = xinfo
+                        .query_map(rusqlite::params![name, schema], |row| {
+                            Ok(row.get::<_, Option<String>>(0)?.unwrap_or_default())
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    indexes.push(IndexInfo {
+                        name,
+                        columns,
+                        unique,
+                        primary: origin == "pk",
+                        kind: Some(origin),
+                        definition: sql,
+                    });
+                }
+
+                if !indexes.iter().any(|i| i.primary) {
+                    let mut pk = conn.prepare(
+                        "SELECT name FROM pragma_table_info(?1, ?2) WHERE pk > 0 ORDER BY pk",
+                    )?;
+                    let columns = pk
+                        .query_map(rusqlite::params![table_name, schema], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if !columns.is_empty() {
+                        indexes.insert(
+                            0,
+                            IndexInfo {
+                                name: "PRIMARY".to_string(),
+                                columns,
+                                unique: true,
+                                primary: true,
+                                kind: Some("pk".to_string()),
+                                definition: None,
+                            },
+                        );
+                    }
+                }
+                Ok::<_, rusqlite::Error>(indexes)
+            })
+            .await?;
+        Ok(indexes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +578,35 @@ mod tests {
             "Database to attach does not exist: {}",
             db_names[1]
         )));
+    }
+
+    #[tokio::test]
+    async fn test_index_discovery() {
+        let pool = SqliteConnectionPoolFactory::new(
+            "./test.sqlite",
+            Mode::Memory,
+            Duration::from_millis(5000),
+        )
+        .build()
+        .await
+        .unwrap();
+        let conn = pool.connect().await.unwrap();
+        let conn = conn.as_async().unwrap();
+        conn.execute("CREATE TABLE ix (id INTEGER PRIMARY KEY, a TEXT UNIQUE, b INT)", &[])
+            .await
+            .unwrap();
+        conn.execute("CREATE INDEX ix_b ON ix (b, lower(a))", &[])
+            .await
+            .unwrap();
+        let indexes = pool.indexes(&TableReference::bare("ix")).await.unwrap();
+        assert_eq!(indexes.len(), 3, "{indexes:?}");
+        assert!(indexes[0].primary && indexes[0].columns == vec!["id".to_string()]);
+        let b = indexes.iter().find(|i| i.name == "ix_b").unwrap();
+        assert_eq!(b.columns, vec!["b".to_string(), String::new()]);
+        assert!(!b.unique);
+        assert!(b.definition.as_deref().unwrap().contains("lower(a)"));
+        let a = indexes.iter().find(|i| i.kind.as_deref() == Some("u")).unwrap();
+        assert!(a.unique && a.columns == vec!["a".to_string()]);
     }
 
     #[tokio::test]
