@@ -31,3 +31,6 @@ federation = ["dep:datafusion-federation", "datafusion-table-providers-common/fe
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

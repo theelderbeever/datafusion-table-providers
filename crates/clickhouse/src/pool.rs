@@ -1,4 +1,5 @@
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::indexes::{IndexDiscovery, IndexInfo};
 use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
 use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use std::{collections::HashMap, sync::Arc};
@@ -192,5 +193,86 @@ impl NativeQueryExecutor for ClickHouseConnectionPool {
         self.connect_direct()?
             .query_arrow_with_params(sql, params, options, None)
             .await
+    }
+}
+
+/// Lists a table's primary key (from `system.tables.primary_key`, as an index named
+/// `PRIMARY` of kind `primary_key`) and its data-skipping indices (from
+/// `system.data_skipping_indices`, whose `columns` hold the index expression). The database
+/// defaults to the client's current database.
+#[async_trait::async_trait]
+impl IndexDiscovery for ClickHouseConnectionPool {
+    async fn indexes(
+        &self,
+        table: &TableReference,
+    ) -> std::result::Result<Vec<IndexInfo>, GenericError> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct KeyRow {
+            primary_key: String,
+        }
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct SkipIndexRow {
+            name: String,
+            #[serde(rename = "type")]
+            type_: String,
+            expr: String,
+            granularity: u64,
+        }
+
+        let database_filter = "database = if(? = '', currentDatabase(), ?)";
+        let database = table.schema().unwrap_or_default();
+
+        let keys: Vec<KeyRow> = self
+            .client
+            .query(&format!(
+                "SELECT primary_key FROM system.tables WHERE {database_filter} AND name = ?"
+            ))
+            .bind(database)
+            .bind(database)
+            .bind(table.table())
+            .fetch_all()
+            .await?;
+
+        let mut indexes = Vec::new();
+        if let Some(key) = keys.into_iter().next() {
+            if !key.primary_key.is_empty() {
+                indexes.push(IndexInfo {
+                    name: "PRIMARY".to_string(),
+                    columns: key
+                        .primary_key
+                        .split(',')
+                        .map(|c| c.trim().to_string())
+                        .collect(),
+                    unique: false,
+                    primary: true,
+                    kind: Some("primary_key".to_string()),
+                    definition: Some(key.primary_key),
+                });
+            }
+        }
+
+        let skip_indexes: Vec<SkipIndexRow> = self
+            .client
+            .query(&format!(
+                "SELECT name, type, expr, granularity FROM system.data_skipping_indices \
+                 WHERE {database_filter} AND table = ? ORDER BY name"
+            ))
+            .bind(database)
+            .bind(database)
+            .bind(table.table())
+            .fetch_all()
+            .await?;
+        indexes.extend(skip_indexes.into_iter().map(|i| IndexInfo {
+            definition: Some(format!(
+                "INDEX {} {} TYPE {} GRANULARITY {}",
+                i.name, i.expr, i.type_, i.granularity
+            )),
+            name: i.name,
+            columns: vec![i.expr],
+            unique: false,
+            primary: false,
+            kind: Some(i.type_),
+        }));
+        Ok(indexes)
     }
 }
