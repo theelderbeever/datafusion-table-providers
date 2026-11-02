@@ -1,6 +1,9 @@
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
-use crate::arrow_sql_gen::{self, map_column_to_data_type, rows_to_arrow};
+use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
+
+use crate::arrow_sql_gen::{self, columns_to_schema, map_column_to_data_type, rows_to_arrow};
+use datafusion::arrow::array::{RecordBatch, RecordBatchOptions};
 use async_stream::stream;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::TableReference;
@@ -9,7 +12,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::sql::unparser::dialect::{Dialect, MySqlDialect};
 use futures::lock::Mutex;
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use mysql_async::consts::ColumnType;
 use mysql_async::prelude::Queryable;
 use mysql_async::{prelude::ToValue, Conn, Params, Row};
@@ -213,19 +216,69 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
         let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
-        let sql = sql.replace('"', "");
+        self.query_stream(sql, Params::from(params_vec), projected_schema)
+            .await
+    }
 
+    async fn execute(&self, query: &str, params: &[&'a (dyn ToValue + Sync)]) -> Result<u64> {
+        let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+        let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
+        let _: Vec<Row> = conn
+            .exec(query, Params::from(params_vec))
+            .await
+            .context(QuerySnafu)?;
+        return Ok(conn.affected_rows());
+    }
+}
+
+enum StreamItem {
+    Schema(SchemaRef),
+    Batch(RecordBatch),
+}
+
+/// Re-labels a decoded batch with the stream schema (adding source metadata), keeping the
+/// batch as decoded if the shapes differ.
+fn conform_batch(batch: RecordBatch, schema: &SchemaRef) -> RecordBatch {
+    let matches = batch.num_columns() == schema.fields().len()
+        && batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(schema.fields())
+            .all(|(a, b)| a.data_type() == b.data_type());
+    if !matches {
+        return batch;
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(Arc::clone(schema), batch.columns().to_vec(), &options)
+        .unwrap_or(batch)
+}
+
+impl MySQLConnection {
+    /// Executes `sql` and streams the result as Arrow batches. The schema comes from the
+    /// result set's column metadata, so a result with zero rows still carries its columns.
+    pub(crate) async fn query_stream(
+        &self,
+        sql: &str,
+        params: Params,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        let sql = sql.replace('"', "");
         let conn = Arc::clone(&self.conn);
 
         let mut stream = Box::pin(stream! {
             let mut conn = conn.lock().await;
             let mut exec_iter = conn
-                .exec_iter(sql, Params::from(params_vec))
+                .exec_iter(sql, params)
                 .await
                 .context(QuerySnafu)?;
 
+            let columns = exec_iter.columns().unwrap_or_else(|| Arc::from(Vec::new()));
+            let schema = columns_to_schema(&columns, &projected_schema);
+            yield Ok::<_, Error>(StreamItem::Schema(Arc::clone(&schema)));
+
             let Some(stream) = exec_iter.stream::<Row>().await.context(QuerySnafu)? else {
-                yield Err(Error::QueryResultStreamError {});
                 return;
             };
 
@@ -238,40 +291,29 @@ impl<'a> AsyncDbConnection<Conn, &'a (dyn ToValue + Sync)> for MySQLConnection {
                     .context(QuerySnafu)?;
 
                 let rec = rows_to_arrow(&rows, &projected_schema).context(ConversionSnafu)?;
-                yield Ok::<_, Error>(rec)
+                yield Ok::<_, Error>(StreamItem::Batch(conform_batch(rec, &schema)))
             }
         });
 
-        let Some(first_chunk) = stream.next().await else {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::new(Schema::empty()),
-                stream::empty(),
-            )));
+        let schema = match stream.next().await {
+            Some(Ok(StreamItem::Schema(schema))) => schema,
+            Some(Ok(StreamItem::Batch(_))) | None => {
+                return Err(Error::QueryResultStreamError {}.into());
+            }
+            Some(Err(e)) => return Err(e.into()),
         };
-
-        let first_chunk = first_chunk?;
-        let schema = first_chunk.schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, {
             stream! {
-                yield Ok(first_chunk);
-                while let Some(batch) = stream.next().await {
-                    yield batch
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to fetch batch: {e}")))
+                while let Some(item) = stream.next().await {
+                    match item {
+                        Ok(StreamItem::Batch(batch)) => yield Ok(batch),
+                        Ok(StreamItem::Schema(_)) => {}
+                        Err(e) => yield Err(DataFusionError::Execution(format!("Failed to fetch batch: {e}"))),
+                    }
                 }
             }
         })))
-    }
-
-    async fn execute(&self, query: &str, params: &[&'a (dyn ToValue + Sync)]) -> Result<u64> {
-        let mut conn = self.conn.lock().await;
-        let conn = &mut *conn;
-        let params_vec: Vec<_> = params.iter().map(|&p| p.to_value()).collect();
-        let _: Vec<Row> = conn
-            .exec(query, Params::from(params_vec))
-            .await
-            .context(QuerySnafu)?;
-        return Ok(conn.affected_rows());
     }
 }
 
@@ -313,10 +355,17 @@ fn columns_meta_to_schema(columns_meta: Vec<Row>) -> Result<SchemaRef> {
         )
         .context(UnsupportedDataTypeSnafu {
             column_name: column_name.clone(),
-            data_type,
+            data_type: data_type.clone(),
         })?;
 
-        fields.push(Field::new(&column_name, arrow_data_type, true));
+        // `SHOW COLUMNS` reports the full `COLUMN_TYPE` (e.g. `decimal(10,2)`,
+        // `int unsigned`, `enum('a','b')`).
+        fields.push(
+            Field::new(&column_name, arrow_data_type, true).with_metadata(HashMap::from([(
+                SOURCE_TYPE_METADATA_KEY.to_string(),
+                data_type,
+            )])),
+        );
     }
     Ok(Arc::new(Schema::new(fields)))
 }

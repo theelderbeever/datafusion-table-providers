@@ -13,6 +13,7 @@ use bigdecimal::ToPrimitive;
 use chrono::{NaiveDate, NaiveTime, Timelike};
 use datafusion_table_providers_common::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder_optional;
 use mysql_async::{consts::ColumnFlags, consts::ColumnType, Column, FromValueError, Row, Value};
+use datafusion_table_providers_common::SOURCE_TYPE_METADATA_KEY;
 use snafu::{ResultExt, Snafu};
 use std::{convert, sync::Arc};
 use time::PrimitiveDateTime;
@@ -100,6 +101,115 @@ macro_rules! handle_primitive_type {
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 #[allow(clippy::too_many_lines)]
+/// The precision of a `DECIMAL` result column, derived from its display length.
+///
+/// MySQL reports `column_length` as precision plus one for the sign (when signed) and one
+/// for the decimal point (when the scale is non-zero).
+fn decimal_precision_from_column(column: &Column) -> u8 {
+    let mut length = column.column_length();
+    if column.decimals() > 0 {
+        length = length.saturating_sub(1);
+    }
+    if !column.flags().contains(ColumnFlags::UNSIGNED_FLAG) {
+        length = length.saturating_sub(1);
+    }
+    u8::try_from(length.clamp(1, 76)).unwrap_or(76)
+}
+
+fn column_data_type(column: &Column, projected_schema: &Option<SchemaRef>) -> Option<DataType> {
+    let column_name = column.name_str();
+    let column_type = column.column_type();
+    let (decimal_precision, decimal_scale) = match column_type {
+        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+            let precision = projected_schema
+                .as_ref()
+                .and_then(|schema| get_decimal_column_precision(&column_name, schema))
+                .unwrap_or_else(|| decimal_precision_from_column(column));
+            (Some(precision), Some(column.decimals() as i8))
+        }
+        _ => (None, None),
+    };
+    map_column_to_data_type(
+        column_type,
+        is_column_binary(column, projected_schema),
+        column.flags().contains(ColumnFlags::ENUM_FLAG),
+        column.flags().contains(ColumnFlags::UNSIGNED_FLAG),
+        column.column_length() > 2_u32.pow(31) - 1,
+        decimal_precision,
+        decimal_scale,
+    )
+}
+
+/// A source type name for a result column, built from its wire type and flags (e.g.
+/// `decimal(10,2)`, `int unsigned`, `varbinary`).
+#[must_use]
+pub fn column_source_type(column: &Column) -> String {
+    let flags = column.flags();
+    let binary = flags.contains(ColumnFlags::BINARY_FLAG) && column.character_set() == 63;
+    let base = match column.column_type() {
+        ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => format!(
+            "decimal({},{})",
+            decimal_precision_from_column(column),
+            column.decimals()
+        ),
+        ColumnType::MYSQL_TYPE_TINY => "tinyint".into(),
+        ColumnType::MYSQL_TYPE_SHORT => "smallint".into(),
+        ColumnType::MYSQL_TYPE_INT24 => "mediumint".into(),
+        ColumnType::MYSQL_TYPE_LONG => "int".into(),
+        ColumnType::MYSQL_TYPE_LONGLONG => "bigint".into(),
+        ColumnType::MYSQL_TYPE_FLOAT => "float".into(),
+        ColumnType::MYSQL_TYPE_DOUBLE => "double".into(),
+        ColumnType::MYSQL_TYPE_NULL => "null".into(),
+        ColumnType::MYSQL_TYPE_BIT => "bit".into(),
+        ColumnType::MYSQL_TYPE_YEAR => "year".into(),
+        ColumnType::MYSQL_TYPE_TIMESTAMP | ColumnType::MYSQL_TYPE_TIMESTAMP2 => "timestamp".into(),
+        ColumnType::MYSQL_TYPE_DATETIME | ColumnType::MYSQL_TYPE_DATETIME2 => "datetime".into(),
+        ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE => "date".into(),
+        ColumnType::MYSQL_TYPE_TIME | ColumnType::MYSQL_TYPE_TIME2 => "time".into(),
+        ColumnType::MYSQL_TYPE_JSON => "json".into(),
+        ColumnType::MYSQL_TYPE_GEOMETRY => "geometry".into(),
+        ColumnType::MYSQL_TYPE_VECTOR => "vector".into(),
+        _ if flags.contains(ColumnFlags::ENUM_FLAG) => "enum".into(),
+        _ if flags.contains(ColumnFlags::SET_FLAG) => "set".into(),
+        ColumnType::MYSQL_TYPE_BLOB
+        | ColumnType::MYSQL_TYPE_TINY_BLOB
+        | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+        | ColumnType::MYSQL_TYPE_LONG_BLOB => if binary { "blob" } else { "text" }.into(),
+        ColumnType::MYSQL_TYPE_STRING => if binary { "binary" } else { "char" }.into(),
+        ColumnType::MYSQL_TYPE_VARCHAR | ColumnType::MYSQL_TYPE_VAR_STRING => {
+            if binary { "varbinary" } else { "varchar" }.into()
+        }
+        other => format!("{other:?}").to_lowercase(),
+    };
+    if flags.contains(ColumnFlags::UNSIGNED_FLAG) {
+        format!("{base} unsigned")
+    } else {
+        base
+    }
+}
+
+/// Builds the Arrow schema of a result set from its column metadata, before any rows are
+/// read. Fields carry [`SOURCE_TYPE_METADATA_KEY`]. Columns of unsupported types are
+/// omitted, matching [`rows_to_arrow`].
+#[must_use]
+pub fn columns_to_schema(columns: &[Column], projected_schema: &Option<SchemaRef>) -> SchemaRef {
+    let fields: Vec<Field> = columns
+        .iter()
+        .filter_map(|column| {
+            let data_type = column_data_type(column, projected_schema)?;
+            Some(
+                Field::new(column.name_str(), data_type, true).with_metadata(
+                    std::collections::HashMap::from([(
+                        SOURCE_TYPE_METADATA_KEY.to_string(),
+                        column_source_type(column),
+                    )]),
+                ),
+            )
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
+}
+
 pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Result<RecordBatch> {
     let mut arrow_fields: Vec<Option<Field>> = Vec::new();
     let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
@@ -120,30 +230,7 @@ pub fn rows_to_arrow(rows: &[Row], projected_schema: &Option<SchemaRef>) -> Resu
             let column_is_unsigned = column.flags().contains(ColumnFlags::UNSIGNED_FLAG);
             let column_use_large_str_or_blob = column.column_length() > 2_u32.pow(31) - 1;
 
-            let (decimal_precision, decimal_scale) = match column_type {
-                ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-                    // use 76 as default precision for decimal types if there is no way to get the precision from the column
-                    match projected_schema {
-                        Some(schema) => {
-                            let precision =
-                                get_decimal_column_precision(&column_name, schema).unwrap_or(76);
-                            (Some(precision), Some(column.decimals() as i8))
-                        }
-                        None => (Some(76), Some(column.decimals() as i8)),
-                    }
-                }
-                _ => (None, None),
-            };
-
-            let data_type = map_column_to_data_type(
-                column_type,
-                column_is_binary,
-                column_is_enum,
-                column_is_unsigned,
-                column_use_large_str_or_blob,
-                decimal_precision,
-                decimal_scale,
-            );
+            let data_type = column_data_type(column, projected_schema);
 
             arrow_fields.push(
                 data_type
