@@ -1,3 +1,6 @@
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::GenericError;
+use datafusion_table_providers_common::sql::db_connection_pool::query::{NativeQueryExecutor, QueryOptions, QueryParams};
 use crate::conn::SqliteConnection;
 use std::{sync::Arc, time::Duration};
 
@@ -341,6 +344,21 @@ impl DbConnectionPool<Connection, &'static (dyn ToSql + Sync)> for SqliteConnect
     }
 }
 
+#[async_trait]
+impl NativeQueryExecutor for SqliteConnectionPool {
+    async fn query(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+    ) -> std::result::Result<SendableRecordBatchStream, GenericError> {
+        use datafusion_table_providers_common::sql::db_connection_pool::dbconnection::AsyncDbConnection;
+        self.new_connection()
+            .query_arrow_with_params(sql, params, options, None)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +494,39 @@ mod tests {
             "Database to attach does not exist: {}",
             db_names[1]
         )));
+    }
+
+    #[tokio::test]
+    async fn test_native_query_executor_binds_params() {
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+        let pool = SqliteConnectionPoolFactory::new(
+            "./test.sqlite",
+            Mode::Memory,
+            Duration::from_millis(5000),
+        )
+        .build()
+        .await
+        .unwrap();
+        let params = QueryParams::positional([ScalarValue::Int64(Some(40))])
+            .with_named("b", ScalarValue::Utf8(Some("x".to_string())));
+        let stream = pool
+            .query("SELECT ? + 2 AS n, :b AS s", &params, &QueryOptions::default())
+            .await
+            .unwrap();
+        let batches: Vec<_> = stream.try_collect().await.unwrap();
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            &DataType::Int64
+        );
+
+        // empty result keeps the schema
+        let stream = pool
+            .query("SELECT 1 AS a WHERE false", &QueryParams::default(), &QueryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(stream.schema().fields().len(), 1);
     }
 
     #[tokio::test]

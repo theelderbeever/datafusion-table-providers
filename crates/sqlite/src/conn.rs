@@ -1,6 +1,8 @@
 use std::{any::Any, sync::Arc};
 
 use crate::arrow_sql_gen::rows_to_arrow;
+use crate::params::{bind_sqlite_params, to_sqlite_params};
+use datafusion_table_providers_common::sql::db_connection_pool::query::{QueryOptions, QueryParams};
 use arrow::datatypes::SchemaRef;
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -182,34 +184,30 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
         params: &[&'static (dyn ToSql + Sync)],
         projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream> {
-        let sql = sql.to_string();
         let params = params.to_vec();
+        self.query_with(sql, projected_schema, move |stmt| {
+            for (i, param) in params.iter().enumerate() {
+                stmt.raw_bind_parameter(i + 1, param)?;
+            }
+            Ok(())
+        })
+        .await
+    }
 
-        let rec = self
-            .conn
-            .call(move |conn| {
-                let mut stmt = conn.prepare(sql.as_str())?;
-                for (i, param) in params.iter().enumerate() {
-                    stmt.raw_bind_parameter(i + 1, param)?;
-                }
-                let column_count = stmt.column_count();
-                let rows = stmt.raw_query();
-
-                let rec = rows_to_arrow(rows, column_count, projected_schema)
-                    .context(ConversionSnafu)
-                    .map_err(to_tokio_rusqlite_error)?;
-                Ok(rec)
-            })
-            .await
-            .context(ConnectionSnafu)?;
-
-        let schema = rec.schema();
-        let recs = if rec.num_rows() > 0 {
-            vec![rec]
-        } else {
-            vec![]
-        };
-        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
+    /// Binds positional (`?`) and named (`:name`, `@name`, `$name`) parameters as owned
+    /// values. Settings are rejected; `query_id` is ignored.
+    async fn query_arrow_with_params(
+        &self,
+        sql: &str,
+        params: &QueryParams,
+        options: &QueryOptions,
+        projected_schema: Option<SchemaRef>,
+    ) -> Result<SendableRecordBatchStream> {
+        let params = to_sqlite_params(params, options)?;
+        self.query_with(sql, projected_schema, move |stmt| {
+            bind_sqlite_params(stmt, &params)
+        })
+        .await
     }
 
     async fn execute(&self, sql: &str, params: &[&'static (dyn ToSql + Sync)]) -> Result<u64> {
@@ -229,6 +227,45 @@ impl AsyncDbConnection<Connection, &'static (dyn ToSql + Sync)> for SqliteConnec
             .await
             .context(ConnectionSnafu)?;
         Ok(rows_modified as u64)
+    }
+}
+
+impl SqliteConnection {
+    /// Prepares `sql`, binds parameters with `bind` and reads the whole result into one batch.
+    async fn query_with<F>(
+        &self,
+        sql: &str,
+        projected_schema: Option<SchemaRef>,
+        bind: F,
+    ) -> Result<SendableRecordBatchStream>
+    where
+        F: FnOnce(&mut rusqlite::Statement<'_>) -> rusqlite::Result<()> + Send + 'static,
+    {
+        let sql = sql.to_string();
+        let rec = self
+            .conn
+            .call(move |conn| {
+                // `prepare` rejects trailing statements (`Error::MultipleStatement`).
+                let mut stmt = conn.prepare(sql.as_str())?;
+                bind(&mut stmt)?;
+                let column_count = stmt.column_count();
+                let rows = stmt.raw_query();
+
+                let rec = rows_to_arrow(rows, column_count, projected_schema)
+                    .context(ConversionSnafu)
+                    .map_err(to_tokio_rusqlite_error)?;
+                Ok(rec)
+            })
+            .await
+            .context(ConnectionSnafu)?;
+
+        let schema = rec.schema();
+        let recs = if rec.num_rows() > 0 {
+            vec![rec]
+        } else {
+            vec![]
+        };
+        Ok(Box::pin(MemoryStream::try_new(recs, schema, None)?))
     }
 }
 
